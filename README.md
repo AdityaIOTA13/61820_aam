@@ -37,8 +37,12 @@ All scripts are run from the repo root and use paths relative to it automaticall
 | `scripts/estimate_depth.py` | Runs Depth Anything V2 Small on all frames → grayscale depth PNGs |
 | `scripts/generate_images.py` | Regenerates the floorplan grid/walkpath PNGs |
 | `scripts/generate_pointcloud.py` | Builds a metric RGB point cloud from depth maps + frame positions |
+| `scripts/add_geo.py` | Adds lat/lon to all waypoints and frame positions using two GPS anchors |
+| `data/geo_reference.json` | GPS anchors, floorplan bearing (61.56° CW from north), all 14 waypoint lat/lons |
 
 **Floorplan scale:** `1400 px = 67 meters` → `1 px = 0.04786 m` / `20.896 px/m`
+
+**Georeferencing:** The floorplan is anchored at `42.378878°N, 71.123678°W` (SVG path start). The +x axis points **61.56° clockwise from true north** (NE direction — the courtyard is not cardinal-aligned). All frame positions and waypoints in `frame_positions.json` and `geo_reference.json` include calibrated `lat`/`lon` fields. See `data/geo_reference.json` for full details.
 
 **Raw 360° video** is hosted on Cloudflare R2 — do not commit it to git:
 ```

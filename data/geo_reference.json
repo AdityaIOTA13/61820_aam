@@ -1,0 +1,132 @@
+{
+  "description": "Georeferencing data for the 61820_aam courtyard scan floorplan",
+  "floorplan_scale": {
+    "width_px": 1400,
+    "width_meters": 67.0,
+    "px_per_meter": 20.8955
+  },
+  "anchors": [
+    {
+      "label": "SVG path start (waypoint 1)",
+      "svg_pixel": [
+        373.5,
+        475.5
+      ],
+      "lat": 42.37887777777778,
+      "lon": -71.12367777777777
+    },
+    {
+      "label": "GPS point on first straight segment",
+      "lat": 42.378927777777776,
+      "lon": -71.12355277777777
+    }
+  ],
+  "svg_x_bearing_deg": 61.56,
+  "svg_x_bearing_note": "Degrees clockwise from true north. The floorplan +x axis points NE, not due east.",
+  "coordinate_system": {
+    "origin": "SVG anchor pixel (373.5, 475.5) = WGS84 anchor lat/lon",
+    "x_axis": "SVG +x (pixel right) \u2192 bearing 61.6\u00b0 CW from north",
+    "y_axis": "SVG +y (pixel down) \u2192 opposite direction (SW-ish)",
+    "z_axis": "Up from floor, metres"
+  },
+  "waypoints": [
+    {
+      "id": 1,
+      "x_px": 373.5,
+      "y_px": 475.5,
+      "lat": 42.37887778,
+      "lon": -71.12367778
+    },
+    {
+      "id": 2,
+      "x_px": 1126.5,
+      "y_px": 475.5,
+      "lat": 42.37903192,
+      "lon": -71.12329242
+    },
+    {
+      "id": 3,
+      "x_px": 1180.0,
+      "y_px": 503.5,
+      "lat": 42.37903229,
+      "lon": -71.12325728
+    },
+    {
+      "id": 4,
+      "x_px": 1193.0,
+      "y_px": 554.5,
+      "lat": 42.37901567,
+      "lon": -71.12323649
+    },
+    {
+      "id": 5,
+      "x_px": 1180.0,
+      "y_px": 604.0,
+      "lat": 42.3789943,
+      "lon": -71.12322943
+    },
+    {
+      "id": 6,
+      "x_px": 1133.0,
+      "y_px": 635.0,
+      "lat": 42.37897295,
+      "lon": -71.12324489
+    },
+    {
+      "id": 7,
+      "x_px": 1015.0,
+      "y_px": 635.0,
+      "lat": 42.3789488,
+      "lon": -71.12330528
+    },
+    {
+      "id": 8,
+      "x_px": 901.5,
+      "y_px": 635.0,
+      "lat": 42.37892556,
+      "lon": -71.12336336
+    },
+    {
+      "id": 9,
+      "x_px": 796.5,
+      "y_px": 635.0,
+      "lat": 42.37890407,
+      "lon": -71.1234171
+    },
+    {
+      "id": 10,
+      "x_px": 697.5,
+      "y_px": 626.0,
+      "lat": 42.37888721,
+      "lon": -71.12347026
+    },
+    {
+      "id": 11,
+      "x_px": 601.0,
+      "y_px": 602.5,
+      "lat": 42.37887634,
+      "lon": -71.12352616
+    },
+    {
+      "id": 12,
+      "x_px": 498.0,
+      "y_px": 563.5,
+      "lat": 42.37887,
+      "lon": -71.12358968
+    },
+    {
+      "id": 13,
+      "x_px": 415.0,
+      "y_px": 518.5,
+      "lat": 42.37887002,
+      "lon": -71.12364462
+    },
+    {
+      "id": 14,
+      "x_px": 368.5,
+      "y_px": 483.5,
+      "lat": 42.37887373,
+      "lon": -71.12367812
+    }
+  ]
+}
