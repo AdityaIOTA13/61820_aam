@@ -58,6 +58,7 @@ All pipeline outputs have been pre-computed and uploaded to Cloudflare R2. Colla
 | **Frames** (183 JPEGs, 2 fps) | `https://assets02.aitkena.com/courtyard_360/frames/frame_NNNNN_T.TTTs.jpg` |
 | **Depth maps** (183 PNGs) | `https://assets02.aitkena.com/courtyard_360/depth_maps/frame_NNNNN_T.TTTs_depth.png` |
 | **Frame positions JSON** | `https://assets02.aitkena.com/courtyard_360/frame_positions.json` |
+| **Depth timelapse video** | `https://assets02.aitkena.com/courtyard_360/depth_timelapse.mp4` |
 | **360° video** | `https://assets02.aitkena.com/courtyard_360/VID_20260429_143550_00_014.mp4` |
 
 **Base URL:** `https://assets02.aitkena.com/courtyard_360/`
