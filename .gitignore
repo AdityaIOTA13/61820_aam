@@ -21,3 +21,4 @@ outputs/frames/
 outputs/depth_maps/
 outputs/depth_timelapse.mp4
 outputs/depth_timelapse_h264.mp4
+outputs/pointcloud.ply

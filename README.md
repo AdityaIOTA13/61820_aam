@@ -36,6 +36,7 @@ All scripts are run from the repo root and use paths relative to it automaticall
 | `scripts/sync_gps_video.py` | Interpolates GPS waypoints across video timeline → `frame_positions.json` |
 | `scripts/estimate_depth.py` | Runs Depth Anything V2 Small on all frames → grayscale depth PNGs |
 | `scripts/generate_images.py` | Regenerates the floorplan grid/walkpath PNGs |
+| `scripts/generate_pointcloud.py` | Builds a metric RGB point cloud from depth maps + frame positions |
 
 **Floorplan scale:** `1400 px = 67 meters` → `1 px = 0.04786 m` / `20.896 px/m`
 
@@ -59,6 +60,7 @@ All pipeline outputs have been pre-computed and uploaded to Cloudflare R2. Colla
 | **Depth maps** (183 PNGs) | `https://assets02.aitkena.com/courtyard_360/depth_maps/frame_NNNNN_T.TTTs_depth.png` |
 | **Frame positions JSON** | `https://assets02.aitkena.com/courtyard_360/frame_positions.json` |
 | **Depth timelapse video** | `https://assets02.aitkena.com/courtyard_360/depth_timelapse.mp4` |
+| **Point cloud (PLY)** | `https://assets02.aitkena.com/courtyard_360/pointcloud.ply` |
 | **360° video** | `https://assets02.aitkena.com/courtyard_360/VID_20260429_143550_00_014.mp4` |
 
 **Base URL:** `https://assets02.aitkena.com/courtyard_360/`
