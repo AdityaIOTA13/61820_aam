@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+cloudflare_r2_complete.json
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Large raw data (hosted on R2 CDN instead)
+data/equirectangular export insta360/
