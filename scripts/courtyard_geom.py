@@ -25,6 +25,12 @@ CAMERA_HEIGHT_M = 1.6
 MAX_DEPTH_M = 18.0
 FLOOR_ELEV_DEG = -65
 
+# Ray-Ban Meta (Gen 2) 12 MP ultra-wide: Meta documents ~100° capture FOV (shooting guides).
+# Default applies that to horizontal azimuth only; vertical uses a wide cap because equirect
+# ground lies at steep elevations (asin dz); a tight symmetric vertical FOV removes all ground hits.
+RAYBAN_META_DEFAULT_HFOV_DEG = 100.0
+RAYBAN_META_DEFAULT_VFOV_DEG = 179.0  # >= 180 disables vertical masking in fov_mask_camera_frame
+
 # SVG waypoints in pixel space (same order as data/svg_path.svg)
 SVG_WAYPOINTS_PX = [
     (373.5, 475.5),
@@ -142,6 +148,35 @@ def camera_heading_from_trajectory(
     return out
 
 
+def fov_mask_camera_frame(
+    dx_c: np.ndarray,
+    dy_c: np.ndarray,
+    dz_c: np.ndarray,
+    hfov_deg: float,
+    vfov_deg: float,
+) -> np.ndarray:
+    """
+    Boolean mask: ray direction (unit, camera frame) lies inside a pyramid aligned with +x
+    (equirect theta=0 at equator = forward). Horizontal angle = atan2(dy, dx); vertical
+    angle from horizontal plane = asin(dz).
+
+    hfov_deg >= 360 or vfov_deg >= 180 disables that axis (keeps all rays on that axis).
+    """
+    if hfov_deg >= 360.0:
+        m_h = np.ones_like(dx_c, dtype=np.bool_)
+    else:
+        az = np.arctan2(dy_c, dx_c)
+        h_half = math.radians(0.5 * hfov_deg)
+        m_h = np.abs(az) <= h_half
+    if vfov_deg >= 180.0:
+        m_v = np.ones_like(dx_c, dtype=np.bool_)
+    else:
+        el = np.arcsin(np.clip(dz_c, -1.0, 1.0))
+        v_half = math.radians(0.5 * vfov_deg)
+        m_v = np.abs(el) <= v_half
+    return m_h & m_v
+
+
 def ground_plane_hits(
     depth_norm: np.ndarray,
     cam_x: float,
@@ -149,12 +184,16 @@ def ground_plane_hits(
     cam_heading: float,
     subsample: int,
     occlusion_margin_m: float = 0.35,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    *,
+    hfov_deg: float = RAYBAN_META_DEFAULT_HFOV_DEG,
+    vfov_deg: float = RAYBAN_META_DEFAULT_VFOV_DEG,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    For subsampled equirect pixels, return (gx, gy, valid) world floor (z=0) intersections
-    in metres when the ray reaches the ground and depth indicates the ground is visible.
+    For subsampled equirect pixels, return (gx, gy) world floor (z=0) intersections in metres
+    when the ray passes FOV masking, reaches the ground, and depth indicates the ground is visible.
 
     World XY matches frame_positions.json (y = metres from bottom of plan).
+    Forward in camera frame is +x (equirect azimuth theta=0 at the horizon ring).
     """
     H, W = depth_norm.shape
     scale = combined_scale(depth_norm, cam_x, cam_y, cam_heading, W, H)
@@ -171,6 +210,8 @@ def ground_plane_hits(
     dy_c = np.cos(phi) * np.sin(theta)
     dz_c = np.sin(phi)
 
+    in_fov = fov_mask_camera_frame(dx_c, dy_c, dz_c, hfov_deg, vfov_deg)
+
     cos_h, sin_h = math.cos(cam_heading), math.sin(cam_heading)
     dx_w = cos_h * dx_c - sin_h * dy_c
     dy_w = sin_h * dx_c + cos_h * dy_c
@@ -184,7 +225,8 @@ def ground_plane_hits(
     t_ground[downward] = -CAMERA_HEIGHT_M / dz_w[downward]
 
     visible_ground = (
-        downward
+        in_fov
+        & downward
         & np.isfinite(t_ground)
         & (t_ground > 0.2)
         & (t_ground < MAX_DEPTH_M * 0.95)
@@ -197,6 +239,64 @@ def ground_plane_hits(
     gy[visible_ground] = cam_y + t_ground[visible_ground] * dy_w[visible_ground]
 
     return gx[visible_ground], gy[visible_ground]
+
+
+def backproject_xy_hits(
+    depth_norm: np.ndarray,
+    cam_x: float,
+    cam_y: float,
+    cam_heading: float,
+    subsample: int,
+    *,
+    hfov_deg: float = RAYBAN_META_DEFAULT_HFOV_DEG,
+    vfov_deg: float = RAYBAN_META_DEFAULT_VFOV_DEG,
+    z_w_min: float = -30.0,
+    z_w_max: float = 50.0,
+    d_min_m: float = 0.12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    3D back-projection (same as generate_pointcloud): P = C + d * u in world metres,
+    then return (P_x, P_y) for map cells. Includes walls, poles, etc.; only loose
+    bounds on world z and depth range reject obvious garbage (sky / clip).
+
+    Camera at (cam_x, cam_y, CAMERA_HEIGHT_M); world z is vertical (metre frame
+    consistent with frame_positions.json).
+    """
+    H, W = depth_norm.shape
+    scale = combined_scale(depth_norm, cam_x, cam_y, cam_heading, W, H)
+    depth_m = np.clip(depth_norm * scale, 0.1, MAX_DEPTH_M)
+
+    v_idx = np.arange(0, H, subsample)
+    u_idx = np.arange(0, W, subsample)
+    vv, uu = np.meshgrid(v_idx, u_idx, indexing="ij")
+
+    theta = (uu / W) * 2 * math.pi
+    phi = math.pi / 2 - (vv / H) * math.pi
+
+    dx_c = np.cos(phi) * np.cos(theta)
+    dy_c = np.cos(phi) * np.sin(theta)
+    dz_c = np.sin(phi)
+
+    in_fov = fov_mask_camera_frame(dx_c, dy_c, dz_c, hfov_deg, vfov_deg)
+
+    cos_h, sin_h = math.cos(cam_heading), math.sin(cam_heading)
+    dx_w = cos_h * dx_c - sin_h * dy_c
+    dy_w = sin_h * dx_c + cos_h * dy_c
+    dz_w = dz_c
+
+    d = depth_m[vv, uu]
+    x_w = cam_x + d * dx_w
+    y_w = cam_y + d * dy_w
+    z_w = CAMERA_HEIGHT_M + d * dz_w
+
+    valid = (
+        in_fov
+        & (d >= d_min_m)
+        & (d < MAX_DEPTH_M * 0.99)
+        & (z_w > z_w_min)
+        & (z_w < z_w_max)
+    )
+    return x_w[valid], y_w[valid]
 
 
 def load_depth_norm(path: Path) -> np.ndarray:

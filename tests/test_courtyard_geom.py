@@ -49,6 +49,37 @@ def test_parse_svg_waypoints_count():
     assert abs(pts[0][0] - 373.5) < 1e-6
 
 
+def test_fov_mask_narrow_horizontal_fewer_hits_than_full_sphere():
+    rng = np.random.default_rng(2)
+    H, W = 320, 640
+    depth_norm = rng.uniform(0.15, 0.85, size=(H, W)).astype(np.float32)
+    depth_norm[int(0.65 * H) :, :] = np.maximum(depth_norm[int(0.65 * H) :, :], 0.92)
+
+    gx_full, gy_full = cg.ground_plane_hits(
+        depth_norm, 18.0, 16.0, 0.0, subsample=8, hfov_deg=400.0, vfov_deg=200.0
+    )
+    # Narrow horizontal cone only; keep vertical wide so ground rays still exist.
+    gx_narrow, gy_narrow = cg.ground_plane_hits(
+        depth_norm, 18.0, 16.0, 0.0, subsample=8, hfov_deg=35.0, vfov_deg=179.0
+    )
+    assert gx_narrow.size < gx_full.size
+    assert gx_narrow.size > 0
+
+
+def test_backproject_xy_hits_returns_points():
+    rng = np.random.default_rng(3)
+    H, W = 320, 640
+    depth_norm = rng.uniform(0.15, 0.85, size=(H, W)).astype(np.float32)
+    depth_norm[int(0.65 * H) :, :] = np.maximum(depth_norm[int(0.65 * H) :, :], 0.92)
+
+    gx, gy = cg.backproject_xy_hits(
+        depth_norm, 18.0, 16.0, 0.0, subsample=10, hfov_deg=400.0, vfov_deg=200.0
+    )
+    assert gx.size == gy.size
+    assert gx.size > 0
+    assert np.isfinite(gx).all()
+
+
 def test_ground_plane_hits_returns_points():
     rng = np.random.default_rng(1)
     H, W = 320, 640

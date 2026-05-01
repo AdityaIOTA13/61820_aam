@@ -134,20 +134,61 @@ scripts/extract_frames.py  →  outputs/frames/  (183 frames at 2 fps)
                               last_seen_sec.npy, coverage_meta.json
 ```
 
-`project_coverage.py` uses the same depth metric scaling and equirectangular rays as `generate_pointcloud.py`, intersects rays with the ground plane (occlusion: depth shorter than ground range discards a pixel), and writes **seconds since last observation** per cell at end of walk (`RdYlGn_r`: green = fresh, red = stale).
+`project_coverage.py` uses the same depth metric scaling and equirectangular rays as `generate_pointcloud.py`. **Default `--projection backproject`:** each ray’s depth hits a 3D point `P = C + d u`; **(P_x, P_y)** marks the map cell (includes façades, poles, ground — loose z/depth bounds only drop junk). **`--projection ground_plane`:** intersection with **z = 0** plus an occlusion test (stricter floor-only). Writes **seconds since last observation** per cell at end of walk (`RdYlGn_r`: green = fresh, red = stale).
+
+**FOV masking (wearable-style forward cone):** Rays are filtered in the **camera frame** before ground projection: horizontal angle `atan2(dy, dx)` from forward **+x** (equirect `theta=0` on the horizon) and vertical angle `asin(dz)` from the horizontal plane. **Horizontal default 100°** follows **Ray-Ban Meta (Gen 2)** ultra-wide capture (Meta shooting guides). **Vertical default 179°** leaves elevation almost unrestricted: a tight symmetric vertical FOV (e.g. 100°) removes nearly all equirect rays that intersect the ground, because ground appears at steep elevations in this projection. Use `--vfov-deg` to tighten if you switch to a forward pinhole crop. `--fov-full-360` disables horizontal masking too (full sphere).
 
 **Floorplan overlays:** If `data/base_floorplan.jpg`, `data/floorplan_walkpath.png`, or `data/floorplan_grid.png` exists (1400×819 or resized to match), heatmaps are blended on top. Otherwise the script draws the SVG walk path on a neutral background. Tune blend with `--overlay-alpha` (default 0.52).
 
 **Full walk:** `python scripts/fetch_sample_frames.py --all` then `python scripts/project_coverage.py`.
+
+**Budget replay (limited “camera on” time):** Pick a subset of frames whose count matches `floor(budget_seconds / mean_dt)` where `mean_dt` is the mean spacing between consecutive **eligible** frames (JPEG + depth on disk). Headings are always taken from the **full** eligible timeline so FOV rays stay aligned with path tangent.
+
+- **Default policy `greedy_local`:** walk the timeline in order; **capture hysteresis** (default on) keeps the camera **on in bursts**: after the trigger fires, frames stay selected until the **local disk** (`--greedy-radius-m`) is fully covered and staleness there drops below an auto **release** threshold (or mean-age release for `mean_age`). That avoids one-frame ON/OFF flicker when a merge instantly clears the trigger. Use **`--no-greedy-hysteresis`** for legacy stepping. Triggers: default **`--greedy-trigger unseen --greedy-unseen-scope foot`** (foot cell never hit by a kept frame); **`--greedy-unseen-scope disk`** = any unseen cell within radius. **`--greedy-trigger unseen_or_stale`** also fires when seen cells in scope exceed **`--greedy-stale-threshold-s`**. Tune release with **`--greedy-stale-release-s`** / **`--greedy-mean-age-release-s`** if needed.
+- **Baselines:** `random`, `uniform` (evenly spaced indices), `prefix` (first K frames). Random uses `--replay-seed`.
+
+**Greedy unseen (default out dir):**
+
+```bash
+python scripts/project_coverage.py --fov-full-360 --budget-seconds 18
+```
+
+Writes e.g. `outputs/coverage_replays/budget_18s_greedy_local_unseen_foot/`.
+
+**Random baseline (seed in folder name):**
+
+```bash
+python scripts/project_coverage.py --fov-full-360 --budget-seconds 18 --replay-policy random --replay-seed 0
+```
+
+Writes under `outputs/coverage_replays/budget_18s_greedy_local_unseen_foot/` (default greedy unseen) or `budget_18s_random_seed0/`, or `--out-dir PATH`. Omit `--budget-seconds` (or `0`) for all eligible frames → `outputs/coverage/`.
+
+**Multi-day revisit simulation** (same physical path; **coverage grid** carries unless **`--reset-coverage`** clears it at each **calendar midnight** before morning):
+
+```bash
+python scripts/simulate_revisit_days.py --days 4 --budget-seconds 18
+python scripts/simulate_revisit_days.py --sessions-per-day 1 --path-direction alternate
+python scripts/simulate_revisit_days.py --reset-coverage --json-out outputs/revisit_sim.json
+```
+
+- **Default `--sessions-per-day 2` (morning / evening):** each **calendar day** has a **forward** walk (morning) and a **backward** walk (evening, rear 360° half via **+pi** on rays unless **`--no-rear-evening-session`**). Sim clock advances by one **walk span** (+ optional **`--between-session-gap-sec`**) between morning and evening so evening runs **later the same day** than morning (avoids treating morning hits as “instantly stale” at the start of the backward pass).
+- **Budget:** **`--budget-seconds`** is the **daily** total shared by morning and evening: one **`k_target`** for the day (`≈ floor(budget / mean_dt)`); morning uses captures first, evening gets what is left. **Morning** default **`--morning-greedy-trigger unseen`**; **evening** default **`--evening-greedy-trigger unseen_or_stale`**. Use **`--morning-greedy-trigger unseen_or_stale --evening-greedy-trigger unseen_or_stale`** for the legacy “same trigger all day” behaviour.
+- **`--sessions-per-day 1`:** one walk per calendar day; use **`--path-direction`** (`forward` / `reverse` / `alternate`) and **`--greedy-trigger`**. Rear on reversed days: **`--no-rear-on-reverse-days`** to disable +pi when the single session is backward.
+- **`--rear-camera`:** +pi on **every** session.
+- **`--seconds-per-day-gap`:** sim seconds between calendar midnights (default 86400).
+- **`--png-dir`:** one PNG set **per session** when using two sessions: **`dayNN_am_*`** and **`dayNN_pm_*`** (plus `last_seen` / meta per write).
+- **`--animation-gif`:** GIF with pose along the **full** eligible path each session (**SCAN** vs **no scan**); default **`--animation-frame-ms`** **36** (faster playback). Staleness is blended between eligibles via **`--animation-interp-substeps`**. **`--animation-vmax-age-sec`**, **`--animation-dual-panel`** as before.
+- **Baseline:** JSON **`baseline_unconstrained`** and **`coverage_fraction_of_baseline_after_sim`** vs always-on all frames (chronological, same FOV).
+- JSON: nested **`days[].sessions[]`** with per-session replay stats.
 
 ---
 
 ## Next Steps
 
 - [x] `project_coverage.py` — floorplane projection + map-age / ever-seen heatmaps (`outputs/coverage/`)
-- [ ] Per-frame visible angle masking (equirectangular → top-down projection accounting for FOV)
+- [x] Per-frame FOV masking — `--hfov-deg` / `--vfov-deg` (default ~100° Ray-Ban Meta style), or `--fov-full-360`
 - [ ] Coverage metric: fraction of courtyard area observed at each depth threshold
-- [ ] Temporal coverage: colour patches by `timestamp_sec` to show scan order
+- [ ] **Temporal scan-order visuals** — The current heatmap encodes **staleness at the end of the walk** (time since *last* hit per cell), not *first* hit time or a time-lapse. A separate “temporal coverage” item would add e.g. first-seen timestamp colouring or an animated GIF over `timestamp_sec`.
 
 ---
 
