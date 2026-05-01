@@ -18,9 +18,15 @@ python scripts/sync_gps_video.py
 
 # 4. Run depth estimation on every frame → outputs/depth_maps/
 python scripts/estimate_depth.py
+
+# 5. (Optional) Quick test without full pipeline — fetch a few assets from R2, then map-age heatmaps
+python scripts/fetch_sample_frames.py --count 5
+python scripts/project_coverage.py --max-frames 5 --resolution 0.25
 ```
 
 All scripts are run from the repo root and use paths relative to it automatically.
+
+**Tests:** `pytest` from repo root (uses synthetic frames; no GPU or R2 required).
 
 ---
 
@@ -37,6 +43,9 @@ All scripts are run from the repo root and use paths relative to it automaticall
 | `scripts/estimate_depth.py` | Runs Depth Anything V2 Small on all frames → grayscale depth PNGs |
 | `scripts/generate_images.py` | Regenerates the floorplan grid/walkpath PNGs |
 | `scripts/generate_pointcloud.py` | Builds a metric RGB point cloud from depth maps + frame positions |
+| `scripts/courtyard_geom.py` | Shared equirectangular depth scaling + ground-plane rays (used by point cloud + coverage) |
+| `scripts/project_coverage.py` | Projects depth onto z=0, accumulates **last observation time** per grid cell → map-age PNGs |
+| `scripts/fetch_sample_frames.py` | Downloads first N frames + depth from R2 for quick local tests |
 | `scripts/add_geo.py` | Adds lat/lon to all waypoints and frame positions using two GPS anchors |
 | `data/geo_reference.json` | GPS anchors, floorplan bearing (61.56° CW from north), all 14 waypoint lat/lons |
 
@@ -119,14 +128,23 @@ scripts/extract_frames.py  →  outputs/frames/  (183 frames at 2 fps)
       └──► scripts/estimate_depth.py  →  outputs/depth_maps/  (183 grayscale depth PNGs)
                                                   │
                                                   ▼
-                                   [next] project_coverage.py  →  coverage heatmap on floorplan
+                        scripts/project_coverage.py  →  outputs/coverage/
+                              map_age_end.png, coverage_ever.png,
+                              map_age_on_floorplan.png, coverage_on_floorplan.png,
+                              last_seen_sec.npy, coverage_meta.json
 ```
+
+`project_coverage.py` uses the same depth metric scaling and equirectangular rays as `generate_pointcloud.py`, intersects rays with the ground plane (occlusion: depth shorter than ground range discards a pixel), and writes **seconds since last observation** per cell at end of walk (`RdYlGn_r`: green = fresh, red = stale).
+
+**Floorplan overlays:** If `data/base_floorplan.jpg`, `data/floorplan_walkpath.png`, or `data/floorplan_grid.png` exists (1400×819 or resized to match), heatmaps are blended on top. Otherwise the script draws the SVG walk path on a neutral background. Tune blend with `--overlay-alpha` (default 0.52).
+
+**Full walk:** `python scripts/fetch_sample_frames.py --all` then `python scripts/project_coverage.py`.
 
 ---
 
 ## Next Steps
 
-- [ ] `project_coverage.py` — project each depth map onto the floorplan using `frame_positions.json`; accumulate into a coverage heatmap
+- [x] `project_coverage.py` — floorplane projection + map-age / ever-seen heatmaps (`outputs/coverage/`)
 - [ ] Per-frame visible angle masking (equirectangular → top-down projection accounting for FOV)
 - [ ] Coverage metric: fraction of courtyard area observed at each depth threshold
 - [ ] Temporal coverage: colour patches by `timestamp_sec` to show scan order

@@ -23,125 +23,31 @@ Run from repo root:  python scripts/generate_pointcloud.py
 
 import json
 import math
+import sys
+from pathlib import Path
+
 import numpy as np
 import open3d as o3d
 from PIL import Image
-from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
 
-FRAMES_DIR    = ROOT / "outputs" / "frames"
-DEPTH_DIR     = ROOT / "outputs" / "depth_maps"
+from courtyard_geom import (
+    CAMERA_HEIGHT_M,
+    MAX_DEPTH_M,
+    combined_scale,
+)
+
+FRAMES_DIR = ROOT / "outputs" / "frames"
+DEPTH_DIR = ROOT / "outputs" / "depth_maps"
 POSITIONS_JSON = ROOT / "outputs" / "frame_positions.json"
-OUTPUT_PLY    = ROOT / "outputs" / "pointcloud.ply"
+OUTPUT_PLY = ROOT / "outputs" / "pointcloud.ply"
 
-CAMERA_HEIGHT_M = 1.6   # assumed camera height above floor (metres)
-SUBSAMPLE       = 6     # use every Nth pixel (6 → 640×320 per frame, ~205K pts)
-VOXEL_SIZE_M    = 0.06  # voxel grid downsampling (metres)
-MAX_DEPTH_M     = 18.0  # clip anything beyond this
-FLOOR_ELEV_DEG  = -65   # elevation threshold for floor constraint (degrees)
-
-# SVG waypoints in pixel space (parsed from data/svg_path.svg, viewBox 1400×819)
-SVG_WAYPOINTS_PX = [
-    (373.5, 475.5), (1126.5, 475.5), (1180.0, 503.5), (1193.0, 554.5),
-    (1180.0, 604.0), (1133.0, 635.0), (1015.0, 635.0), (901.5, 635.0),
-    (796.5, 635.0), (697.5, 626.0), (601.0, 602.5), (498.0, 563.5),
-    (415.0, 518.5), (368.5, 483.5),
-]
-IMG_W_PX, IMG_H_PX = 1400, 819
-REAL_W_M = 67.0
-PX_PER_M = IMG_W_PX / REAL_W_M
-REAL_H_M = IMG_H_PX / PX_PER_M
-
-# Convert waypoints to world metres (flip Y: SVG top-left → world bottom-left)
-SVG_WAYPOINTS_M = [
-    (x / PX_PER_M, (IMG_H_PX - y) / PX_PER_M)
-    for x, y in SVG_WAYPOINTS_PX
-]
-
-
-# ── Calibration helpers ────────────────────────────────────────────────────────
-
-def floor_scale(depth_norm: np.ndarray) -> float:
-    """
-    Estimate metric scale factor from the bottom strip of the depth map.
-    Pixels at elevation φ < FLOOR_ELEV_DEG see the ground at depth = CAMERA_HEIGHT_M / |sin(φ)|.
-    """
-    H, W = depth_norm.shape
-    phi_thresh = FLOOR_ELEV_DEG * math.pi / 180.0          # negative radians
-    # pixel row where elevation == phi_thresh
-    v_thresh = int((0.5 - phi_thresh / math.pi) * H)
-    v_thresh = max(0, min(v_thresh, H - 1))
-
-    v_rows = np.arange(v_thresh, H)
-    if len(v_rows) == 0:
-        return MAX_DEPTH_M
-
-    phi_rows = math.pi / 2 - v_rows / H * math.pi          # elevation per row
-    expected = CAMERA_HEIGHT_M / np.abs(np.sin(phi_rows))   # expected floor depth (m)
-    measured = depth_norm[v_rows, :].mean(axis=1)           # mean norm depth per row
-
-    valid = measured > 0.02
-    if not valid.any():
-        return MAX_DEPTH_M
-
-    scales = expected[valid] / measured[valid]
-    return float(np.median(scales))
-
-
-def svg_waypoint_scale(
-    depth_norm: np.ndarray,
-    cam_x: float, cam_y: float, cam_heading: float,
-    W: int, H: int,
-) -> float | None:
-    """
-    For the closest SVG waypoint (world XY on the floor), compute the expected
-    depth from the camera, find the corresponding equirectangular pixel, read the
-    depth value there, and return the implied scale factor.
-    Returns None if the waypoint is behind the camera or too close.
-    """
-    best_scale = None
-    best_dist = float("inf")
-
-    for wx, wy in SVG_WAYPOINTS_M:
-        dx = wx - cam_x
-        dy = wy - cam_y
-        dz = -CAMERA_HEIGHT_M            # waypoint is on the floor, camera is above
-        real_dist = math.sqrt(dx**2 + dy**2 + dz**2)
-        if real_dist < 0.5:              # skip waypoints right under the camera
-            continue
-
-        # Direction in world → rotate by -heading to get camera-local azimuth
-        world_az = math.atan2(dy, dx)
-        cam_az = world_az - cam_heading  # relative azimuth
-        cam_el = math.atan2(dz, math.sqrt(dx**2 + dy**2))  # elevation (negative)
-
-        # Map to equirectangular pixel
-        u = ((cam_az % (2 * math.pi)) / (2 * math.pi)) * W
-        v = (math.pi / 2 - cam_el) / math.pi * H
-        u = int(np.clip(u, 0, W - 1))
-        v = int(np.clip(v, 0, H - 1))
-
-        d_norm = float(depth_norm[v, u])
-        if d_norm < 0.02:
-            continue
-
-        implied_scale = real_dist / d_norm
-        if implied_scale < MAX_DEPTH_M * 0.5 and real_dist < best_dist:
-            best_dist = real_dist
-            best_scale = implied_scale
-
-    return best_scale
-
-
-def combined_scale(depth_norm, cam_x, cam_y, cam_heading, W, H) -> float:
-    s_floor = floor_scale(depth_norm)
-    s_svg   = svg_waypoint_scale(depth_norm, cam_x, cam_y, cam_heading, W, H)
-
-    if s_svg is None:
-        return s_floor
-    # Weight SVG more heavily (it's a hard geometric constraint)
-    return 0.35 * s_floor + 0.65 * s_svg
+SUBSAMPLE = 6  # use every Nth pixel (6 → 640×320 per frame, ~205K pts)
+VOXEL_SIZE_M = 0.06  # voxel grid downsampling (metres)
 
 
 # ── Per-frame processing ───────────────────────────────────────────────────────
