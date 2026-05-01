@@ -19,6 +19,7 @@ data/video_cache.mp4
 # Generated outputs — large files hosted on R2
 outputs/frames/
 outputs/depth_maps/
+outputs/raw_depths/
 outputs/depth_timelapse.mp4
 outputs/depth_timelapse_h264.mp4
 outputs/pointcloud.ply

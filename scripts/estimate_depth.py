@@ -22,9 +22,10 @@ try:
 except ImportError:
     sys.exit("ERROR: Run `pip install torch transformers` first.")
 
-ROOT = Path(__file__).parent.parent
+ROOT       = Path(__file__).parent.parent
 FRAMES_DIR = ROOT / "outputs" / "frames"
 DEPTH_DIR  = ROOT / "outputs" / "depth_maps"
+RAW_DIR    = ROOT / "outputs" / "raw_depths"   # float32 .npy files (unscaled)
 MODEL_ID   = "depth-anything/Depth-Anything-V2-Small-hf"
 
 
@@ -55,19 +56,23 @@ def main():
         sys.exit(f"ERROR: No frames in '{FRAMES_DIR.relative_to(ROOT)}/'. Run extract_frames.py first.")
 
     DEPTH_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
     pipe = load_pipeline()
     n = len(frame_paths)
-    print(f"Processing {n} frames → '{DEPTH_DIR.relative_to(ROOT)}/'")
+    print(f"Processing {n} frames → '{DEPTH_DIR.relative_to(ROOT)}/' + '{RAW_DIR.relative_to(ROOT)}/'")
 
     for i, fp in enumerate(frame_paths, 1):
-        out_path = DEPTH_DIR / f"{fp.stem}_depth.png"
-        if out_path.exists():
+        png_path = DEPTH_DIR / f"{fp.stem}_depth.png"
+        npy_path = RAW_DIR   / f"{fp.stem}_depth.npy"
+        if png_path.exists() and npy_path.exists():
             print(f"  [{i:>4}/{n}] skip (exists): {fp.name}", end="\r")
             continue
         image = Image.open(fp).convert("RGB")
         result = pipe(image)
-        save_depth(np.array(result["depth"]), out_path)
-        print(f"  [{i:>4}/{n}] {out_path.name}", end="\r")
+        raw = np.array(result["depth"], dtype=np.float32)
+        np.save(str(npy_path), raw)           # raw float32 — used for point cloud
+        save_depth(raw, png_path)             # normalised PNG — used for visualisation
+        print(f"  [{i:>4}/{n}] {fp.name}", end="\r")
 
     print(f"\nDone. Depth maps saved to '{DEPTH_DIR.relative_to(ROOT)}/'")
 
