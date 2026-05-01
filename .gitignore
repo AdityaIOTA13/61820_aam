@@ -23,5 +23,8 @@ outputs/raw_depths/
 outputs/depth_timelapse.mp4
 outputs/depth_timelapse_h264.mp4
 outputs/pointcloud.ply
-outputs/coverage/
+outputs/revisit_maps/
+outputs/revisit_sim.mp4
+outputs/revisit_tmp/
+outputs/coverage/*.npy
 outputs/coverage_replays/

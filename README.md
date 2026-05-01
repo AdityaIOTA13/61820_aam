@@ -74,6 +74,7 @@ All pipeline outputs have been pre-computed and uploaded to Cloudflare R2. Colla
 | **Frame positions JSON** | `https://assets02.aitkena.com/courtyard_360/frame_positions.json` |
 | **Depth timelapse video** | `https://assets02.aitkena.com/courtyard_360/depth_timelapse.mp4` |
 | **Point cloud (PLY)** | `https://assets02.aitkena.com/courtyard_360/pointcloud.ply` |
+| **7-day revisit simulation (MP4)** | `https://assets02.aitkena.com/courtyard_360/revisit_sim.mp4` |
 | **360° video** | `https://assets02.aitkena.com/courtyard_360/VID_20260429_143550_00_014.mp4` |
 
 **Base URL:** `https://assets02.aitkena.com/courtyard_360/`

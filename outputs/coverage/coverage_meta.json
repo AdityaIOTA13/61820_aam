@@ -1,0 +1,17 @@
+{
+  "frames_used": 183,
+  "frames_with_depth_files": 183,
+  "rays_accumulated": 4284290,
+  "grid_nx": 345,
+  "grid_ny": 206,
+  "resolution_m": 0.2,
+  "origin_x0_m": -1.0,
+  "origin_y0_m": -1.0,
+  "t_end_sec": 91.091,
+  "frac_cells_ever_seen": 0.04556071478823695,
+  "hfov_deg": 100.0,
+  "vfov_deg": 179.0,
+  "projection": "backproject",
+  "last_frame_timestamp_sec": 91.091,
+  "floorplan_source": "data/base_floorplan.jpg"
+}
