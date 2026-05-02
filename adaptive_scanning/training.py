@@ -31,13 +31,15 @@ class MLPPolicy(nn.Module, Policy):
         return self.net(x)
 
     def act(self, obs: np.ndarray, info: dict) -> int:
+        dev = next(self.parameters()).device
         with torch.no_grad():
-            x = torch.from_numpy(obs).float().unsqueeze(0)
+            x = torch.from_numpy(obs).float().unsqueeze(0).to(dev)
             logits = self.forward_logits(x)
             return int(torch.argmax(logits, dim=-1).item())
 
     def act_stochastic(self, obs: np.ndarray) -> tuple[int, torch.Tensor]:
-        x = torch.from_numpy(obs).float().unsqueeze(0)
+        dev = next(self.parameters()).device
+        x = torch.from_numpy(obs).float().unsqueeze(0).to(dev)
         logits = self.forward_logits(x)
         dist = torch.distributions.Categorical(logits=logits)
         a = dist.sample()

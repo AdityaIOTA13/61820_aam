@@ -9,22 +9,27 @@ cloudflare_r2_complete.json
 __pycache__/
 *.pyc
 *.pyo
+*.py[cod]
+*$py.class
 .venv/
 venv/
+.env/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Generated / local caches (OSM pickles, run artifacts, figures, policies, etc.)
+outputs/
+cache/
 
 # Large raw data (hosted on R2 CDN instead)
 data/equirectangular export insta360/
 data/video_cache.mp4
-
-# Generated outputs — large files hosted on R2
-outputs/frames/
-outputs/depth_maps/
-outputs/raw_depths/
-outputs/depth_timelapse.mp4
-outputs/depth_timelapse_h264.mp4
-outputs/pointcloud.ply
-outputs/revisit_maps/
-outputs/revisit_sim.mp4
-outputs/revisit_tmp/
-outputs/coverage/*.npy
-outputs/coverage_replays/
