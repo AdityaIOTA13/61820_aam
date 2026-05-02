@@ -68,6 +68,7 @@ def train_reinforce(
     gamma: float = 0.995,
     seed: int = 0,
     device: str | None = None,
+    show_progress: bool = True,
 ) -> tuple[MLPPolicy, TrainResult]:
     torch.manual_seed(seed)
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -78,11 +79,44 @@ def train_reinforce(
     rng = np.random.default_rng(seed)
     history: list[dict[str, float]] = []
 
-    for ep in range(epochs):
+    tqdm_mod: Any = None
+    if show_progress:
+        try:
+            from tqdm.auto import tqdm
+
+            tqdm_mod = tqdm
+        except ImportError:
+            tqdm_mod = None
+
+    pbar = None
+    if tqdm_mod is not None:
+        pbar = tqdm_mod(
+            range(epochs),
+            desc="REINFORCE",
+            unit="epoch",
+            dynamic_ncols=True,
+            mininterval=0.25,
+        )
+    epoch_iter = pbar if pbar is not None else range(epochs)
+
+    for ep in epoch_iter:
+        if pbar is not None:
+            pbar.set_postfix_str(f"ep {ep + 1}/{epochs} rollouts…")
+            pbar.refresh()
         opt.zero_grad()
         batch_logp: list[torch.Tensor] = []
         batch_ret: list[torch.Tensor] = []
-        for _ in range(episodes_per_epoch):
+        inner_it = range(episodes_per_epoch)
+        if tqdm_mod is not None:
+            inner_it = tqdm_mod(
+                range(episodes_per_epoch),
+                desc=f"rollouts ep {ep + 1}/{epochs}",
+                unit="run",
+                leave=False,
+                dynamic_ncols=True,
+                mininterval=0.15,
+            )
+        for _ in inner_it:
             s = int(rng.integers(0, 2**31 - 1))
             obs, _info = env.reset(seed=s)
             logps: list[torch.Tensor] = []
@@ -107,12 +141,18 @@ def train_reinforce(
 
         if not batch_logp:
             continue
+        if pbar is not None:
+            pbar.set_postfix_str(f"ep {ep + 1}/{epochs} backward+step…")
+            pbar.refresh()
         logp_stack = torch.stack(batch_logp)
         ret_stack = torch.stack(batch_ret)
         loss = -(logp_stack * ret_stack).mean()
         loss.backward()
         opt.step()
 
+        if pbar is not None:
+            pbar.set_postfix_str(f"ep {ep + 1}/{epochs} eval…")
+            pbar.refresh()
         with torch.no_grad():
             metrics = eval_policy(env, policy, n_episodes=4, seed0=ep + 1000)
         history.append(
@@ -123,6 +163,15 @@ def train_reinforce(
                 "stale_mean": metrics["stale_mean"],
             }
         )
+        if pbar is not None:
+            pbar.set_postfix(
+                loss=f"{float(loss.item()):.4f}",
+                R=f"{float(metrics['return_mean']):.3f}",
+                unc=f"{float(metrics['uncovered_mean']):.3f}",
+            )
+
+    if pbar is not None:
+        pbar.close()
 
     return policy, TrainResult(history=history)
 

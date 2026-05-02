@@ -5,8 +5,10 @@ import networkx as nx
 
 from adaptive_scanning.street_trajectories import (
     affine_map_points,
+    annotate_playback_events_si_timeline,
     build_single_leg_trajectory,
     build_street_trajectory,
+    inverse_affine_world_to_graph,
     resample_polyline_at_speed,
 )
 
@@ -21,6 +23,36 @@ def _toy_street_graph() -> nx.MultiDiGraph:
         G.add_edge(i, i + 1, length=25.0)
         G.add_edge(i + 1, i, length=25.0)
     return G
+
+
+def test_annotate_playback_si_timeline_moving_cumulative():
+    ev = [
+        {"phase": "morning_home", "t_start_s": 0.0, "t_end_s": 100.0, "day_index": 0},
+        {
+            "phase": "travel",
+            "t_start_s": 100.0,
+            "t_end_s": 200.0,
+            "day_index": 0,
+            "arc_length_m": 135.0,
+        },
+    ]
+    annotate_playback_events_si_timeline(ev, walk_speed_m_s=1.35)
+    assert ev[0]["t_moving_cumulative_at_end_s"] == 0.0
+    assert ev[1]["t_moving_cumulative_at_start_s"] == 0.0
+    assert ev[1]["t_moving_cumulative_at_end_s"] == 100.0
+    assert abs(float(ev[1]["effective_speed_m_s"]) - 1.35) < 1e-6
+
+
+def test_inverse_affine_roundtrips_graph_points():
+    xy = np.array([[0.0, 0.0], [100.0, 50.0], [200.0, 0.0]], dtype=np.float64)
+    w = 128.0
+    h = 128.0
+    mapped = affine_map_points(xy, margin=1.0, world_w_m=w, world_h_m=h)
+    back = inverse_affine_world_to_graph(
+        mapped, xy, world_w_m=w, world_h_m=h, margin=1.0
+    )
+    assert back.shape == xy.shape
+    assert np.allclose(back, xy, atol=1e-5, rtol=0.0)
 
 
 def test_affine_map_aspect_preserves_shape():

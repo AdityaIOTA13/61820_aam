@@ -22,6 +22,10 @@ def _tiny_cfg():
         patch_cells=7,
         hfov_deg=100.0,
         scan_radius_m=15.0,
+        motion_mode="box",
+        osm_daily_home_commute=False,
+        osm_bbox=None,
+        osm_place="",
     )
 
 
@@ -57,10 +61,19 @@ def test_random_policy_runs():
 
 
 def test_export_batch_smoke():
+    from adaptive_scanning.data_export import save_episode_npz
+
     cfg = _tiny_cfg()
     batch = generate_synthetic_episode_batch(cfg=cfg, n_episodes=2, seed=0)
     assert len(batch["episodes"]) == 2
     assert batch["episodes"][0]["actions"].shape[0] == batch["episodes"][0]["rewards"].shape[0]
+    assert batch["episodes"][0]["trajectory_source"] == "box"
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "batch.npz"
+        save_episode_npz(p, batch)
+        with np.load(p, allow_pickle=True) as z:
+            assert "ep0_trajectory_source" in z.files
+            assert str(z["ep0_trajectory_source"][0]) == "box"
 
 
 def test_visualize_episode_writes_png():
@@ -69,6 +82,22 @@ def test_visualize_episode_writes_png():
     cfg = _tiny_cfg()
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "preview.png"
-        path, _src, _bm, _cov_pack = visualize_episode(cfg, policy_name="always_on", seed=3, out_path=out)
+        path, _src, _bm, _cov_pack, _pb, _dp = visualize_episode(
+            cfg, policy_name="always_on", seed=3, out_path=out
+        )
+        assert path is not None
         assert path.exists()
         assert path.stat().st_size > 500
+
+
+def test_visualize_episode_skip_png_no_panel_file():
+    from adaptive_scanning.viz import visualize_episode
+
+    cfg = _tiny_cfg()
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "maps_only.png"
+        path, _src, _bm, _cov_pack, _pb, _dp = visualize_episode(
+            cfg, policy_name="always_on", seed=3, out_path=out, skip_episode_png=True
+        )
+        assert path is None
+        assert not out.exists()

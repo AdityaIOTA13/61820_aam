@@ -23,6 +23,8 @@ def save_realworld_folium_html(
     age_rgba: np.ndarray | None,
     age_bounds_wgs84: tuple[float, float, float, float] | None,
     title: str = "Coverage explorer",
+    extra_feature_groups: list[Any] | None = None,
+    colored_path_layers_3857: list[tuple[str, str, Any]] | None = None,
 ) -> Path | None:
     """
     Write a self-contained HTML map with layer control (path, coverage, optional age).
@@ -30,6 +32,8 @@ def save_realworld_folium_html(
     ``coverage_3857`` / ``path_line_3857``: shapely geometry in EPSG:3857 metres.
     ``age_rgba``: uint8 (H, W, 4) with alpha 0 where no data; ``age_bounds_wgs84`` is
     (west, south, east, north) in degrees for the overlay corners.
+    If ``colored_path_layers_3857`` is set, each ``(layer_name, color_hex, linestring_3857)`` is drawn
+    instead of the single ``path_line_3857`` layer (bounds still include coverage + all paths).
     """
     try:
         import folium
@@ -43,14 +47,21 @@ def save_realworld_folium_html(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     cov = gpd.GeoDataFrame(geometry=[coverage_3857], crs=3857).to_crs(4326)
-    path = gpd.GeoDataFrame(geometry=[path_line_3857], crs=3857).to_crs(4326)
-    w0, s0, e0, n0 = cov.total_bounds
-    w1, s1, e1, n1 = path.total_bounds
-    w, s = min(w0, w1), min(s0, s1)
-    e, n = max(e0, e1), max(n0, n1)
+    if colored_path_layers_3857:
+        geoms3857 = [coverage_3857]
+        for _name, _col, g in colored_path_layers_3857:
+            geoms3857.append(g)
+        bb = gpd.GeoDataFrame(geometry=geoms3857, crs=3857).to_crs(4326)
+        w, s, e, nlat = bb.total_bounds
+    else:
+        path = gpd.GeoDataFrame(geometry=[path_line_3857], crs=3857).to_crs(4326)
+        w0, s0, e0, n0 = cov.total_bounds
+        w1, s1, e1, n1 = path.total_bounds
+        w, s = min(w0, w1), min(s0, s1)
+        e, nlat = max(e0, e1), max(n0, n1)
 
     m = folium.Map(
-        location=[0.5 * (s + n), 0.5 * (w + e)],
+        location=[0.5 * (s + nlat), 0.5 * (w + e)],
         zoom_start=13,
         tiles="OpenStreetMap",
         control_scale=True,
@@ -68,16 +79,32 @@ def save_realworld_folium_html(
     ).add_to(fg_cov)
     fg_cov.add_to(m)
 
-    fg_path = folium.FeatureGroup(name="Path A→B", show=True)
-    folium.GeoJson(
-        path.to_json(),
-        style_function=lambda _f: {
-            "color": "#c0392b",
-            "weight": 4,
-            "opacity": 0.95,
-        },
-    ).add_to(fg_path)
-    fg_path.add_to(m)
+    if colored_path_layers_3857:
+        for layer_name, col_hex, geom3857 in colored_path_layers_3857:
+            fg_d = folium.FeatureGroup(name=layer_name, show=True)
+            p4326 = gpd.GeoDataFrame(geometry=[geom3857], crs=3857).to_crs(4326)
+
+            def style_fn(_feature: Any, color: str = col_hex) -> dict[str, Any]:
+                return {"color": color, "weight": 4, "opacity": 0.95}
+
+            folium.GeoJson(p4326.to_json(), style_function=style_fn).add_to(fg_d)
+            fg_d.add_to(m)
+    else:
+        path = gpd.GeoDataFrame(geometry=[path_line_3857], crs=3857).to_crs(4326)
+        fg_path = folium.FeatureGroup(name="Path A→B", show=True)
+        folium.GeoJson(
+            path.to_json(),
+            style_function=lambda _f: {
+                "color": "#c0392b",
+                "weight": 4,
+                "opacity": 0.95,
+            },
+        ).add_to(fg_path)
+        fg_path.add_to(m)
+
+    if extra_feature_groups:
+        for fg in extra_feature_groups:
+            fg.add_to(m)
 
     if age_rgba is not None and age_bounds_wgs84 is not None:
         aw, as_, ae, an = age_bounds_wgs84
@@ -105,7 +132,7 @@ def save_realworld_folium_html(
     )
     m.get_root().html.add_child(Element(title_html))
 
-    m.fit_bounds([[s, w], [n, e]], padding=(24, 24))
+    m.fit_bounds([[s, w], [nlat, e]], padding=(24, 24))
     m.save(str(out_path))
     return out_path
 

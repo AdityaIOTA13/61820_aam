@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -42,13 +43,17 @@ def generate_synthetic_episode_batch(
             obs_l.append(obs.copy())
             if st.terminated or st.truncated:
                 break
-        episodes.append(
-            {
-                "observations": np.stack(obs_l, axis=0),
-                "actions": np.array(act_l, dtype=np.int64),
-                "rewards": np.array(rew_l, dtype=np.float32),
-            }
-        )
+        hm = getattr(env, "_osm_home_daily_meta", None)
+        traj_src = str(getattr(env, "_trajectory_source", "?"))
+        ep_out: dict[str, Any] = {
+            "observations": np.stack(obs_l, axis=0),
+            "actions": np.array(act_l, dtype=np.int64),
+            "rewards": np.array(rew_l, dtype=np.float32),
+            "trajectory_source": traj_src,
+        }
+        if hm is not None and isinstance(hm.get("playback"), dict):
+            ep_out["playback"] = copy.deepcopy(hm["playback"])
+        episodes.append(ep_out)
     return {"config": cfg.__dict__, "episodes": episodes}
 
 
@@ -61,4 +66,10 @@ def save_episode_npz(path: str | Path, batch: dict[str, Any]) -> None:
         flat[f"ep{i}_obs"] = ep["observations"]
         flat[f"ep{i}_actions"] = ep["actions"]
         flat[f"ep{i}_rewards"] = ep["rewards"]
+        ts = ep.get("trajectory_source")
+        if ts is not None:
+            flat[f"ep{i}_trajectory_source"] = np.array([str(ts)], dtype=object)
+        pb = ep.get("playback")
+        if isinstance(pb, dict) and pb:
+            flat[f"ep{i}_playback_json"] = np.array([json.dumps(pb)], dtype=object)
     np.savez_compressed(path, **flat)

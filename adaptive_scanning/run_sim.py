@@ -7,6 +7,10 @@ CLI for adaptive scanning simulation.
   python -m adaptive_scanning.run_sim visualize --fast --policy random --out outputs/adaptive_scanning/preview.png
   python -m adaptive_scanning.run_sim visualize --fast --one-path --out outputs/adaptive_scanning/osm_one_leg.png
   python -m adaptive_scanning.run_sim four-paths --place "Cambridge, Massachusetts, USA" --seed 2 --out outputs/adaptive_scanning/four_paths_example
+  python -m adaptive_scanning.run_sim visualize --fast --one-path --mit-campus --out outputs/adaptive_scanning/mit.png
+  python -m adaptive_scanning.run_sim visualize --streets --mit-campus --home-commute --walks-per-day 3 --days 4 --same-home-p 0.6 --skip-episode-png --out outputs/adaptive_scanning/home_round
+  python -m adaptive_scanning.run_sim export --streets --mit-campus --home-commute --walks-per-day 3 --days 4 --n-episodes 8 --out outputs/adaptive_scanning/home_commute_batch.npz
+  python -m adaptive_scanning.run_sim visualize --policy greedy_budget --skip-episode-png --video-budget-minutes-per-day 3 --coverage-first-minutes-per-day 3 --out outputs/adaptive_scanning/day_prefix_demo.png
   # Default OSM area when --streets/--one-path with no --place/--bbox: Cambridge, MA (see street_trajectories.DEFAULT_OSM_PLACE)
 """
 
@@ -57,6 +61,60 @@ def _add_street_cli_args(sub: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Single OSM shortest path (one start→end); implies --streets",
     )
+    sub.add_argument(
+        "--mit-campus",
+        action="store_true",
+        help="Restrict OSM graph/maps to MIT main campus bbox (WGS84); sets bbox, clears --place",
+    )
+
+
+def _add_home_commute_cli_args(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "--home-commute",
+        action="store_true",
+        help="Streets only: chained daily walks from/to one fixed home; see --repeat-destination-p",
+    )
+    sub.add_argument(
+        "--walks-per-day",
+        type=int,
+        default=3,
+        help="With --home-commute: shortest-path legs per day (>=2); walk i+1 starts where walk i ended",
+    )
+    sub.add_argument(
+        "--days",
+        type=int,
+        default=0,
+        help="With --home-commute: if >0, set episode length to this many full walking days (day_duration_s each)",
+    )
+    sub.add_argument(
+        "--same-home-p",
+        type=float,
+        default=0.6,
+        help="With --home-commute: unused (one home for the whole episode); kept for CLI compatibility",
+    )
+    sub.add_argument(
+        "--repeat-destination-p",
+        type=float,
+        default=0.35,
+        help="With --home-commute: per intermediate stop, prob. of reusing a prior day's destination (else new node)",
+    )
+
+
+def _apply_home_commute_cli(cfg: "AdaptiveScanningConfig", args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "home_commute", False)):
+        return
+    if cfg.motion_mode != "streets":
+        raise SystemExit("--home-commute requires --streets (OSM motion)")
+    cfg.osm_daily_home_commute = True
+    cfg.osm_single_leg = False
+    cfg.osm_walks_per_day = max(2, int(args.walks_per_day))
+    cfg.osm_same_home_next_day_p = float(args.same_home_p)
+    cfg.osm_repeat_destination_across_days_p = float(
+        getattr(args, "repeat_destination_p", 0.35)
+    )
+    ndays = int(getattr(args, "days", 0))
+    if ndays > 0:
+        cfg.max_sim_time_s = float(ndays) * float(cfg.day_duration_s)
 
 
 def _merge_street_cli(cfg: "AdaptiveScanningConfig", args: argparse.Namespace) -> None:
@@ -64,12 +122,21 @@ def _merge_street_cli(cfg: "AdaptiveScanningConfig", args: argparse.Namespace) -
     if one_path:
         cfg.osm_single_leg = True
         cfg.motion_mode = "streets"
+        cfg.osm_daily_home_commute = False  # incompatible with single start→end leg
     if not getattr(args, "streets", False) and not one_path:
         return
     if not one_path:
         cfg.motion_mode = "streets"
     bbox_str = (getattr(args, "bbox", "") or "").strip()
-    if bbox_str:
+    mit = bool(getattr(args, "mit_campus", False))
+    if mit and bbox_str:
+        raise SystemExit("Use only one of --mit-campus or --bbox")
+    if mit:
+        from adaptive_scanning.street_trajectories import MIT_CAMPUS_BBOX_WGS84
+
+        cfg.osm_bbox = MIT_CAMPUS_BBOX_WGS84
+        cfg.osm_place = ""
+    elif bbox_str:
         parts = [float(x.strip()) for x in bbox_str.split(",")]
         if len(parts) != 4:
             raise SystemExit("--bbox must be four comma-separated numbers: west,south,east,north")
@@ -95,9 +162,14 @@ def _fast_cfg() -> "AdaptiveScanningConfig":
         resolution_m=2.0,
         max_sim_time_s=2 * 3600.0,
         day_duration_s=3600.0,
-        seconds_video_budget_per_day=60.0,
-        dt_s=10.0,
+        seconds_video_budget_per_day=150.0,  # half of default 5 min/day for fast smoke runs
+        dt_s=5.0,
         patch_cells=15,
+        motion_mode="box",
+        osm_daily_home_commute=False,
+        osm_single_leg=False,
+        osm_bbox=None,
+        osm_place="",
     )
 
 
@@ -117,6 +189,7 @@ def main(argv: list[str] | None = None) -> None:
     pe.add_argument("--episodes", type=int, default=16)
     pe.add_argument("--seed", type=int, default=0)
     _add_street_cli_args(pe)
+    _add_home_commute_cli_args(pe)
 
     pt = sub.add_parser("train", help="Train REINFORCE MLP policy")
     pt.add_argument("--fast", action="store_true", help="Small grid / short horizon for smoke tests")
@@ -125,7 +198,19 @@ def main(argv: list[str] | None = None) -> None:
     pt.add_argument("--lr", type=float, default=3e-4)
     pt.add_argument("--seed", type=int, default=0)
     pt.add_argument("--out", type=str, default="", help="Optional path to save policy .pt")
+    pt.add_argument(
+        "--video-budget-minutes-per-day",
+        type=float,
+        default=0.0,
+        help="If >0, set seconds_video_budget_per_day to this many minutes of camera-on per day_duration_s",
+    )
+    pt.add_argument(
+        "--no-train-progress",
+        action="store_true",
+        help="Disable tqdm epoch progress bar during training",
+    )
     _add_street_cli_args(pt)
+    _add_home_commute_cli_args(pt)
 
     px = sub.add_parser("export", help="Generate synthetic episode batch to .npz")
     px.add_argument("--fast", action="store_true", help="Small grid / short horizon for smoke tests")
@@ -133,8 +218,12 @@ def main(argv: list[str] | None = None) -> None:
     px.add_argument("--n-episodes", type=int, default=32)
     px.add_argument("--seed", type=int, default=0)
     _add_street_cli_args(px)
+    _add_home_commute_cli_args(px)
 
-    pv = sub.add_parser("visualize", help="Save a 3-panel PNG of one synthetic episode (path, map age, camera on)")
+    pv = sub.add_parser(
+        "visualize",
+        help="Episode preview: 3-panel PNG (optional) plus basemap/coverage sidecars when streets mode applies",
+    )
     pv.add_argument("--fast", action="store_true", help="Small grid / short horizon for smoke tests")
     pv.add_argument(
         "--policy",
@@ -148,6 +237,24 @@ def main(argv: list[str] | None = None) -> None:
         type=str,
         default=str(ROOT / "outputs" / "adaptive_scanning" / "episode_preview.png"),
     )
+    pv.add_argument(
+        "--skip-episode-png",
+        action="store_true",
+        help="Do not write the 3-panel episode PNG; still write basemap/coverage outputs that use the same stem",
+    )
+    pv.add_argument(
+        "--coverage-first-minutes-per-day",
+        type=float,
+        default=0.0,
+        help="If >0, also write day-prefix coverage: with playback, first N·60·walk_speed metres of path *after morning_home* each day; else first N minutes of sim clock per day. Writes *_day_first{Ns}_*.png/.html",
+    )
+    pv.add_argument(
+        "--video-budget-minutes-per-day",
+        type=float,
+        default=0.0,
+        help="If >0, set seconds_video_budget_per_day to this many minutes of camera-on per day_duration_s (default is 5 min unless --fast)",
+    )
+    _add_home_commute_cli_args(pv)
     _add_street_cli_args(pv)
 
     pch = sub.add_parser(
@@ -162,7 +269,7 @@ def main(argv: list[str] | None = None) -> None:
 
     pf = sub.add_parser(
         "four-paths",
-        help="Four OSM shortest paths with overlapping start/end clusters (PNG + optional HTML)",
+        help="Four OSM shortest paths with probabilistic reuse of prior starts/ends (PNG + optional HTML)",
     )
     pf.add_argument("--fast", action="store_true", help="Unused for now; keeps CLI consistent")
     pf.add_argument("--seed", type=int, default=0)
@@ -181,6 +288,7 @@ def main(argv: list[str] | None = None) -> None:
     use_fast = bool(getattr(args, "fast", False))
     cfg: AdaptiveScanningConfig = _fast_cfg() if use_fast else _default_cfg()
     _merge_street_cli(cfg, args)
+    _apply_home_commute_cli(cfg, args)
 
     if args.cmd == "eval":
         from adaptive_scanning.policies import (
@@ -211,12 +319,17 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "train":
         from adaptive_scanning.training import save_policy, train_reinforce
 
+        vbm_tr = float(getattr(args, "video_budget_minutes_per_day", 0.0))
+        if vbm_tr > 0.0:
+            cfg.seconds_video_budget_per_day = float(vbm_tr) * 60.0
+
         pol, result = train_reinforce(
             cfg,
             epochs=args.epochs,
             episodes_per_epoch=args.episodes_per_epoch,
             lr=args.lr,
             seed=args.seed,
+            show_progress=not bool(getattr(args, "no_train_progress", False)),
         )
         print("last_epoch", json.dumps(result.history[-1] if result.history else {}, indent=2))
         if args.out:
@@ -235,18 +348,33 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "visualize":
         from adaptive_scanning.viz import visualize_episode
 
-        path, traj_src, basemap, coverage_pack = visualize_episode(
+        vbm = float(getattr(args, "video_budget_minutes_per_day", 0.0))
+        if vbm > 0.0:
+            cfg.seconds_video_budget_per_day = float(vbm) * 60.0
+
+        path, traj_src, basemap, coverage_pack, playback_json, day_prefix_pack = visualize_episode(
             cfg,
             policy_name=str(args.policy),
             seed=int(args.seed),
             out_path=str(args.out),
+            skip_episode_png=bool(args.skip_episode_png),
+            coverage_first_minutes_per_day=float(
+                getattr(args, "coverage_first_minutes_per_day", 0.0)
+            ),
         )
-        print(str(path.resolve()))
+        if path is not None:
+            print(str(path.resolve()))
         print(f"trajectory_source={traj_src}")
         if basemap is not None:
             print(str(basemap.resolve()))
         if coverage_pack is not None:
             for p in coverage_pack:
+                if p is not None:
+                    print(str(p.resolve()))
+        if playback_json is not None:
+            print(str(playback_json.resolve()))
+        if day_prefix_pack is not None:
+            for p in day_prefix_pack:
                 if p is not None:
                     print(str(p.resolve()))
 

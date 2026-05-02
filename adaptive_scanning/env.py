@@ -45,6 +45,7 @@ class CameraBudgetEnv:
         self._trajectory_source: str = "box"
         self._polyline_graph_m: np.ndarray | None = None
         self._graph_crs: str | None = None
+        self._osm_home_daily_meta: dict[str, Any] | None = None
 
     @property
     def world_w_m(self) -> float:
@@ -65,6 +66,7 @@ class CameraBudgetEnv:
             from pathlib import Path
 
             from adaptive_scanning.street_trajectories import (
+                try_build_home_daily_episode_trajectory,
                 try_build_single_leg_trajectory,
                 try_build_street_trajectory,
             )
@@ -75,7 +77,27 @@ class CameraBudgetEnv:
                 from adaptive_scanning.street_trajectories import DEFAULT_OSM_PLACE
 
                 place = DEFAULT_OSM_PLACE
-            if c.osm_single_leg:
+            tr = None
+            if getattr(c, "osm_daily_home_commute", False):
+                tr = try_build_home_daily_episode_trajectory(
+                    cache_dir=Path(c.osm_cache_dir),
+                    place=place,
+                    bbox=bbox,
+                    rng=self.rng,
+                    world_w_m=self.world_w_m,
+                    world_h_m=self.world_h_m,
+                    max_sim_time_s=float(c.max_sim_time_s),
+                    day_duration_s=float(c.day_duration_s),
+                    dt_s=float(c.dt_s),
+                    speed_m_s=float(c.walk_speed_m_s),
+                    walks_per_day=int(c.osm_walks_per_day),
+                    same_home_next_day_p=float(c.osm_same_home_next_day_p),
+                    repeat_destination_across_days_p=float(
+                        getattr(c, "osm_repeat_destination_across_days_p", 0.35)
+                    ),
+                    network_type=c.osm_network_type,
+                )
+            elif c.osm_single_leg:
                 tr = try_build_single_leg_trajectory(
                     cache_dir=Path(c.osm_cache_dir),
                     place=place,
@@ -105,7 +127,18 @@ class CameraBudgetEnv:
                     network_type=c.osm_network_type,
                 )
             if tr is not None:
-                if c.osm_single_leg and len(tr) == 5:
+                if len(tr) == 6:
+                    (
+                        self._traj_x,
+                        self._traj_y,
+                        self._traj_h,
+                        self._polyline_graph_m,
+                        self._graph_crs,
+                        meta,
+                    ) = tr
+                    self._osm_home_daily_meta = meta
+                    self._trajectory_source = "osm_home_daily"
+                elif len(tr) == 5:
                     (
                         self._traj_x,
                         self._traj_y,
@@ -113,13 +146,14 @@ class CameraBudgetEnv:
                         self._polyline_graph_m,
                         self._graph_crs,
                     ) = tr
+                    self._osm_home_daily_meta = None
+                    self._trajectory_source = "osm_single_leg"
                 else:
                     self._traj_x, self._traj_y, self._traj_h = tr  # type: ignore[assignment]
                     self._polyline_graph_m = None
                     self._graph_crs = None
-                self._trajectory_source = (
-                    "osm_single_leg" if c.osm_single_leg else "osm_streets"
-                )
+                    self._osm_home_daily_meta = None
+                    self._trajectory_source = "osm_streets"
             else:
                 warnings.warn(
                     "motion_mode='streets' but OSM trajectory failed (missing osmnx, "
@@ -132,11 +166,13 @@ class CameraBudgetEnv:
                 self._trajectory_source = "box_fallback"
                 self._polyline_graph_m = None
                 self._graph_crs = None
+                self._osm_home_daily_meta = None
         else:
             self._traj_x, self._traj_y, self._traj_h = self._fallback_box_trajectory(n_steps)
             self._trajectory_source = "box"
             self._polyline_graph_m = None
             self._graph_crs = None
+            self._osm_home_daily_meta = None
         self._step_idx = 0
         self._sim_time_s = 0.0
         self._budget_s = c.seconds_video_budget_per_day
