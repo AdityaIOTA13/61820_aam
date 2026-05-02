@@ -7,3 +7,8 @@ huggingface_hub
 requests
 matplotlib
 pytest
+networkx
+osmnx
+geopandas
+contextily
+folium
