@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import math
+import time
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -235,6 +238,42 @@ class CameraBudgetEnv:
         half = math.radians(0.5 * c.hfov_deg)
         return (dist <= c.scan_radius_m) & (np.abs(ang) <= half) & (dist >= 1e-3)
 
+    def _apply_sector_while_moving(
+        self,
+        x0: float,
+        y0: float,
+        h0: float,
+        x1: float,
+        y1: float,
+        h1: float,
+        stamp: float,
+    ) -> None:
+        """
+        While the camera is on for one ``dt_s`` interval, the agent moves from
+        (x0,y0,h0) toward (x1,y1,h1). Integrate sector coverage along that segment
+        so ``last_seen`` matches holding the shutter for the full interval.
+        """
+        assert self.last_seen is not None
+        c = self.cfg
+        dx = float(x1 - x0)
+        dy = float(y1 - y0)
+        dist = math.hypot(dx, dy)
+        if dist < 1e-4:
+            m = self._sector_mask(x0, y0, h0)
+            self.last_seen[m] = np.maximum(self.last_seen[m], stamp)
+            return
+        step_m = max(0.5 * float(c.resolution_m), 0.35)
+        n = int(math.ceil(dist / step_m)) + 1
+        n = max(2, min(40, n))
+        dh = float(_wrap_pi(h1 - h0))
+        for j in range(n):
+            t = j / (n - 1) if n > 1 else 0.0
+            ax = x0 + t * dx
+            ay = y0 + t * dy
+            hd = float(_wrap_pi(h0 + t * dh))
+            m = self._sector_mask(ax, ay, hd)
+            self.last_seen[m] = np.maximum(self.last_seen[m], stamp)
+
     def _uncovered_fraction(self) -> float:
         assert self.last_seen is not None
         never = ~np.isfinite(self.last_seen)
@@ -323,14 +362,48 @@ class CameraBudgetEnv:
         ax0 = float(self._traj_x[self._step_idx])
         ay0 = float(self._traj_y[self._step_idx])
         hd0 = float(self._traj_h[self._step_idx])
+        stamp = float(self._sim_time_s)
+        i1 = min(self._step_idx + 1, len(self._traj_x) - 1)
+        ax1 = float(self._traj_x[i1])
+        ay1 = float(self._traj_y[i1])
+        hd1 = float(self._traj_h[i1])
 
         on = int(action) == 1
         budget_ok = self._budget_s >= c.dt_s - 1e-9
         actually_on = on and budget_ok
 
+        # region agent log
+        if self._step_idx < 45:
+            _p = Path(__file__).resolve().parent.parent / "debug-edc71f.log"
+            try:
+                with open(_p, "a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "sessionId": "edc71f",
+                                "hypothesisId": "H5",
+                                "location": "env.py:CameraBudgetEnv.step",
+                                "message": "action_vs_budget",
+                                "data": {
+                                    "step_idx": int(self._step_idx),
+                                    "action": int(action),
+                                    "on_requested": bool(on),
+                                    "budget_ok": bool(budget_ok),
+                                    "budget_s": float(self._budget_s),
+                                    "dt_s": float(c.dt_s),
+                                    "camera_on_effective": bool(actually_on),
+                                },
+                                "timestamp": int(time.time() * 1000),
+                            }
+                        )
+                        + "\n"
+                    )
+            except OSError:
+                pass
+        # endregion agent log
+
         if actually_on:
-            m = self._sector_mask(ax0, ay0, hd0)
-            self.last_seen[m] = np.maximum(self.last_seen[m], self._sim_time_s)
+            self._apply_sector_while_moving(ax0, ay0, hd0, ax1, ay1, hd1, stamp)
             self._budget_s -= c.dt_s
 
         self._sim_time_s += c.dt_s

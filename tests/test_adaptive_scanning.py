@@ -90,6 +90,29 @@ def test_visualize_episode_writes_png():
         assert path.stat().st_size > 500
 
 
+def test_train_reinforce_writes_log_dir():
+    from adaptive_scanning.training import train_reinforce
+
+    cfg = _tiny_cfg()
+    with tempfile.TemporaryDirectory() as td:
+        logd = Path(td) / "logs"
+        pol, res = train_reinforce(
+            cfg,
+            epochs=2,
+            episodes_per_epoch=2,
+            lr=1e-2,
+            seed=0,
+            show_progress=False,
+            log_dir=logd,
+        )
+        assert len(res.history) == 2
+        assert (logd / "config.json").is_file()
+        assert (logd / "metrics.jsonl").is_file()
+        assert (logd / "history.json").is_file()
+        assert (logd / "training_curves.png").is_file()
+        assert pol.net[0].in_features == CameraBudgetEnv(cfg, seed=0).observation_dim
+
+
 def test_visualize_episode_skip_png_no_panel_file():
     from adaptive_scanning.viz import visualize_episode
 

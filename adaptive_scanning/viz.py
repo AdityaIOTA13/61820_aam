@@ -380,6 +380,122 @@ def _sector_wedge_polygon(
     return Polygon(ring)
 
 
+def _wrap_pi_scalar(a: float) -> float:
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def _wedge_polygons_motion_segment_utm(
+    x0: float,
+    y0: float,
+    h0: float,
+    x1: float,
+    y1: float,
+    h1: float,
+    *,
+    radius_m: float,
+    hfov_deg: float,
+    resolution_m: float,
+) -> list[Any]:
+    """Several sector wedges along one walked segment (matches env scan integration)."""
+    dx = x1 - x0
+    dy = y1 - y0
+    dist = math.hypot(dx, dy)
+    if dist < 1e-4:
+        return [_sector_wedge_polygon(x0, y0, h0, radius_m, hfov_deg)]
+    step_m = max(0.5 * float(resolution_m), 0.35)
+    n = max(2, min(40, int(math.ceil(dist / step_m)) + 1))
+    dh = _wrap_pi_scalar(h1 - h0)
+    out: list[Any] = []
+    for j in range(n):
+        t = j / (n - 1) if n > 1 else 0.0
+        ax = x0 + t * dx
+        ay = y0 + t * dy
+        hd = _wrap_pi_scalar(h0 + t * dh)
+        out.append(_sector_wedge_polygon(ax, ay, hd, radius_m, hfov_deg))
+    return out
+
+
+def _policy_camera_coverage_union_3857(
+    rec: dict[str, Any],
+    xs: np.ndarray,
+    ys: np.ndarray,
+    poly: np.ndarray,
+    graph_crs: str,
+    utm_crs: Any,
+    cfg: AdaptiveScanningConfig,
+) -> Any | None:
+    """
+    Union of motion-integrated sector wedges in **UTM**, same recipe as always-on coverage,
+    but only for segments where ``camera_on_effective`` is true. Returned in EPSG:3857.
+    """
+    import geopandas as gpd
+    from shapely.ops import unary_union
+
+    from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph
+
+    xs = np.asarray(xs, dtype=np.float64).ravel()
+    ys = np.asarray(ys, dtype=np.float64).ravel()
+    if xs.size < 2 or xs.size != ys.size:
+        return None
+    nseg = int(xs.size) - 1
+    on = np.asarray(rec["camera_on_effective"], dtype=np.float64).ravel()[:nseg] > 0.5
+    if not np.any(on):
+        return None
+
+    world_w_m = float(cfg.nx) * float(cfg.resolution_m)
+    world_h_m = float(cfg.ny) * float(cfg.resolution_m)
+    poly_a = np.asarray(poly, dtype=np.float64)
+    xy_w = np.column_stack([xs, ys])
+    xy_g = inverse_affine_world_to_graph(
+        xy_w,
+        poly_a,
+        world_w_m=world_w_m,
+        world_h_m=world_h_m,
+        margin=1.0,
+    )
+    gdf = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(xy_g[:, 0], xy_g[:, 1]),
+        crs=str(graph_crs),
+    ).to_crs(utm_crs)
+    xu = np.asarray(gdf.geometry.x, dtype=np.float64)
+    yu = np.asarray(gdf.geometry.y, dtype=np.float64)
+
+    hs = rec.get("traj_heading_rad")
+    npt = int(xs.size)
+    hu = np.zeros(npt, dtype=np.float64)
+    if hs is not None and int(np.asarray(hs).size) == npt:
+        hu[:] = np.asarray(hs, dtype=np.float64).ravel()[:npt]
+    elif npt >= 2:
+        for ii in range(npt - 1):
+            hu[ii] = math.atan2(float(yu[ii + 1] - yu[ii]), float(xu[ii + 1] - xu[ii]))
+        hu[-1] = hu[-2]
+
+    r_m = float(cfg.scan_radius_m)
+    wedges: list[Any] = []
+    for k in range(nseg):
+        if not bool(on[k]):
+            continue
+        wedges.extend(
+            _wedge_polygons_motion_segment_utm(
+                float(xu[k]),
+                float(yu[k]),
+                float(hu[k]),
+                float(xu[k + 1]),
+                float(yu[k + 1]),
+                float(hu[k + 1]),
+                radius_m=r_m,
+                hfov_deg=float(cfg.hfov_deg),
+                resolution_m=float(cfg.resolution_m),
+            )
+        )
+    if not wedges:
+        return None
+    uu = unary_union(wedges)
+    if uu.is_empty:
+        return None
+    return gpd.GeoDataFrame(geometry=[uu], crs=utm_crs).to_crs(3857).geometry.iloc[0]
+
+
 def _map_extent_webmerc_from_cfg(
     cfg: AdaptiveScanningConfig,
     route_line_3857: Any,
@@ -448,60 +564,334 @@ def _route_zoom_bounds_3857(gwm: Any, r_m: float, *, pad_frac: float = 0.38) -> 
     return (xmin - pad, ymin - pad, xmax + pad, ymax + pad)
 
 
-def _norm_age_rgba_utm(
-    x: np.ndarray,
-    y: np.ndarray,
-    h: np.ndarray,
-    n_scan: int,
-    r_m: float,
-    hfov_deg: float,
-    utm_crs: Any,
+def _staleness_grid_to_rgba_rdylgn(
+    value_grid: np.ndarray,
+    *,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    alpha: int = 238,
+    stale_ref_s: float | None = None,
+) -> np.ndarray:
+    """
+    ``value_grid`` NaN = transparent. Otherwise higher value = staler → red;
+    lower = fresher → green (matplotlib ``RdYlGn``).
+
+    If ``vmin`` / ``vmax`` are None, uses **min and max** of finite values so the
+    oldest pixel in view maps to red and the newest to green.
+
+    When ages are **nearly uniform**, expanding vmin/vmax symmetrically would map
+    every pixel to RdYlGn(0.5) (yellow). Instead we derive a single staleness tone
+    from the typical age vs ``stale_ref_s`` (seconds).
+    """
+    from matplotlib import colormaps
+
+    cmap = colormaps["RdYlGn"]
+    mnan = np.isnan(value_grid)
+    valid = ~mnan
+    if vmin is None or vmax is None:
+        if not np.any(valid):
+            rgba = np.zeros((*value_grid.shape, 4), dtype=np.uint8)
+            return rgba
+        vals = value_grid[valid].astype(np.float64).ravel()
+        lo = float(np.nanmin(vals))
+        hi = float(np.nanmax(vals))
+        if vmin is None:
+            vmin = lo
+        if vmax is None:
+            vmax = hi
+    assert vmin is not None and vmax is not None
+    span = float(vmax) - float(vmin)
+    tol = 1e-9 * max(abs(float(vmax)), abs(float(vmin)), 1.0)
+    ref = float(stale_ref_s) if stale_ref_s is not None and float(stale_ref_s) > 0 else 3600.0
+
+    stale = np.zeros_like(value_grid, dtype=np.float64)
+    if span <= tol:
+        # Uniform (or duplicate min=max): avoid RdYlGn midpoint yellow.
+        mid = 0.5 * (float(vmin) + float(vmax))
+        stale_u = float(np.clip(mid / (3.0 * ref), 0.0, 1.0))
+        stale[~mnan] = stale_u
+    else:
+        stale[~mnan] = np.clip((value_grid[~mnan] - vmin) / (vmax - vmin), 0.0, 1.0)
+    fresh = 1.0 - stale
+    rgba = (cmap(np.where(mnan, 0.5, fresh)) * 255.0).astype(np.uint8)
+    rgba[mnan, :] = 0
+    rgba[~mnan, 3] = alpha
+    return rgba
+
+
+def _sim_time_grid_to_rgba_turbo(
+    time_s: np.ndarray,
+    *,
+    vmin: float,
+    vmax: float,
+    alpha: int = 238,
+) -> np.ndarray:
+    """``time_s`` NaN = transparent. Finite values mapped linearly ``vmin``…``vmax`` with ``turbo``."""
+    from matplotlib import colormaps
+
+    cmap = colormaps["turbo"]
+    mnan = np.isnan(time_s)
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+    t = np.zeros_like(time_s, dtype=np.float64)
+    t[~mnan] = np.clip((time_s[~mnan] - vmin) / (vmax - vmin), 0.0, 1.0)
+    rgba = (cmap(np.where(mnan, 0.5, t)) * 255.0).astype(np.uint8)
+    rgba[mnan, :] = 0
+    rgba[~mnan, 3] = alpha
+    return rgba
+
+
+def _graph_xy_to_world_xy(
+    poly: np.ndarray,
+    xy_graph: np.ndarray,
+    *,
+    world_w_m: float,
+    world_h_m: float,
+    margin: float = 1.0,
+) -> np.ndarray:
+    """Same letterbox as ``inverse_affine_world_to_graph`` / env, using **poly** for scale."""
+    xy = np.asarray(poly, dtype=np.float64)
+    gx = xy[:, 0]
+    gy = xy[:, 1]
+    gw = float(np.ptp(gx)) + 1e-6
+    gh = float(np.ptp(gy)) + 1e-6
+    inner_w = float(world_w_m) - 2.0 * float(margin)
+    inner_h = float(world_h_m) - 2.0 * float(margin)
+    scale = min(inner_w / gw, inner_h / gh)
+    cx = 0.5 * (float(np.min(gx)) + float(np.max(gx)))
+    cy = 0.5 * (float(np.min(gy)) + float(np.max(gy)))
+    wx0 = 0.5 * float(world_w_m)
+    wy0 = 0.5 * float(world_h_m)
+    ug = np.asarray(xy_graph, dtype=np.float64).reshape(-1, 2)
+    ex = wx0 + (ug[:, 0] - cx) * scale
+    ey = wy0 + (ug[:, 1] - cy) * scale
+    return np.column_stack([ex, ey])
+
+
+def _sector_scan_age_rgba_wgs84(
+    rec: dict[str, Any],
+    cov_geom_3857: Any,
     zoom_bounds_3857: tuple[float, float, float, float],
     *,
-    nx: int = 112,
-    ny: int = 112,
-) -> tuple[np.ndarray, tuple[float, float, float, float]]:
-    """Raster of scan-age (last step index − first hit) in UTM; RGBA + WGS84 overlay bounds."""
+    always_on_reference: bool,
+    xw_path: np.ndarray,
+    yw_path: np.ndarray,
+    h_path: np.ndarray,
+    poly: np.ndarray,
+    graph_crs: str,
+    world_w_m: float,
+    world_h_m: float,
+    nx: int = 640,
+    ny: int = 640,
+    stamp_debug_path: Path | None = None,
+) -> tuple[np.ndarray, tuple[float, float, float, float], int] | None:
+    """
+    Sector stamping matches ``CameraBudgetEnv`` (**world metres** + trajectory heading).
+
+    The output raster is aligned to the Folium **EPSG:3857** zoom box; each pixel maps
+    to world (x,y) via graph CRS so distance/angle tests match the simulator. Using
+    Web-Mercator chord headings with Mercator positions skewed sectors and collapsed
+    ``last_scan`` to a constant / zeros.
+    """
     import geopandas as gpd
-    from matplotlib import colormaps
     from pyproj import Transformer
-    from shapely.geometry import box
+
+    from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph
+
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    final_t = float(rec.get("final_sim_time_s", 0.0))
+    dt_s = float(cfg.dt_s)
+    r_m = float(cfg.scan_radius_m)
+    half = math.radians(0.5 * float(cfg.hfov_deg))
+    res_m = float(cfg.resolution_m)
+    poly_a = np.asarray(poly, dtype=np.float64)
 
     zx0, zy0, zx1, zy1 = zoom_bounds_3857
-    utmb = gpd.GeoDataFrame(geometry=[box(zx0, zy0, zx1, zy1)], crs=3857).to_crs(utm_crs)
-    ux0, uy0, ux1, uy1 = utmb.total_bounds
+    xmin, xmax = (min(zx0, zx1), max(zx0, zx1))
+    ymin, ymax = (min(zy0, zy1), max(zy0, zy1))
+    gx = np.linspace(xmin, xmax, nx, dtype=np.float64)
+    gy = np.linspace(ymin, ymax, ny, dtype=np.float64)
+    Wx, Wy = np.meshgrid(gx, gy)
+    flat_m = np.column_stack([Wx.ravel(), Wy.ravel()])
+    gdfg = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(flat_m[:, 0], flat_m[:, 1]),
+        crs=3857,
+    ).to_crs(graph_crs)
+    x_graph = np.asarray(gdfg.geometry.x, dtype=np.float64)
+    y_graph = np.asarray(gdfg.geometry.y, dtype=np.float64)
+    xy_world = _graph_xy_to_world_xy(
+        poly_a,
+        np.column_stack([x_graph, y_graph]),
+        world_w_m=world_w_m,
+        world_h_m=world_h_m,
+        margin=1.0,
+    )
+    WWx = xy_world[:, 0].reshape(Wx.shape)
+    WWy = xy_world[:, 1].reshape(Wy.shape)
 
-    gx = np.linspace(ux0, ux1, nx, dtype=np.float64)
-    gy = np.linspace(uy0, uy1, ny, dtype=np.float64)
-    wx, wy = np.meshgrid(gx, gy)
-    first = np.full((ny, nx), np.inf, dtype=np.float64)
-    half = math.radians(0.5 * float(hfov_deg))
-    work = n_scan * nx * ny
-    inner_stride = max(1, int(math.ceil(work / 12_000_000)))
-    for i in range(0, n_scan, inner_stride):
-        dx = wx - float(x[i])
-        dy = wy - float(y[i])
-        dist = np.hypot(dx, dy)
-        ang = np.arctan2(dy, dx) - float(h[i])
-        ang = _wrap_pi(ang)
-        m = (dist <= r_m) & (dist >= 1e-3) & (np.abs(ang) <= half)
-        first = np.where(m, np.minimum(first, float(i)), first)
+    t_gr_m = Transformer.from_crs(str(graph_crs), 3857, always_xy=True)
+    last_scan = np.full((ny, nx), -np.inf, dtype=np.float64)
 
-    last_i = float(max(0, n_scan - 1))
-    age = last_i - first
-    age[~np.isfinite(first)] = np.nan
-    mx_age = float(np.nanmax(age)) if np.any(np.isfinite(age)) else 1.0
-    norm = np.clip(age / max(mx_age, 1.0), 0.0, 1.0)
-    cmap = colormaps["magma_r"]
-    rgba = (cmap(norm) * 255.0).astype(np.uint8)
-    mnan = np.isnan(norm)
-    rgba[mnan, :] = 0
+    nseg = int(np.asarray(xw_path).shape[0]) - 1
+    if nseg < 1:
+        if stamp_debug_path is not None:
+            stamp_debug_path.write_text(
+                "status=FAIL\nreason=nseg<1 (path needs at least 2 points)\n", encoding="utf-8"
+            )
+        return None
 
-    t4326 = Transformer.from_crs(utm_crs, 4326, always_xy=True)
-    lons, lats = t4326.transform([ux0, ux1, ux1, ux0], [uy0, uy0, uy1, uy1])
+    if always_on_reference:
+        on = np.ones(nseg, dtype=bool)
+        stamps = np.arange(nseg, dtype=np.float64) * dt_s
+    else:
+        on = np.asarray(rec["camera_on_effective"], dtype=np.float64).ravel()[:nseg] > 0.5
+        sim_arr = np.asarray(rec["sim_time_s"], dtype=np.float64).ravel()
+        if sim_arr.size < nseg:
+            if stamp_debug_path is not None:
+                stamp_debug_path.write_text(
+                    "status=FAIL\n"
+                    f"reason=sim_time_s shorter than nseg\nnseg={nseg}\n"
+                    f"len(sim_time_s)={sim_arr.size}\n",
+                    encoding="utf-8",
+                )
+            return None
+        stamps = sim_arr[:nseg] - dt_s
+
+    merc_pad = max(r_m * 2.5, 85.0)
+    step_m = max(0.5 * res_m, 0.35)
+    for k in range(nseg):
+        if not bool(on[k]):
+            continue
+        stamp = float(stamps[k])
+        x0, y0, h0 = float(xw_path[k]), float(yw_path[k]), float(h_path[k])
+        x1, y1, h1 = float(xw_path[k + 1]), float(yw_path[k + 1]), float(h_path[k + 1])
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            ns = 1
+        else:
+            ns = max(2, min(40, int(math.ceil(dist / step_m)) + 1))
+        dh = _wrap_pi_scalar(h1 - h0)
+        for j in range(ns):
+            t = j / (ns - 1) if ns > 1 else 0.0
+            pw_x = x0 + t * dx
+            pw_y = y0 + t * dy
+            ph = _wrap_pi_scalar(h0 + t * dh)
+            gxy_s = inverse_affine_world_to_graph(
+                np.array([[pw_x, pw_y]], dtype=np.float64),
+                poly_a,
+                world_w_m=world_w_m,
+                world_h_m=world_h_m,
+                margin=1.0,
+            )
+            pmx, pmy = t_gr_m.transform(float(gxy_s[0, 0]), float(gxy_s[0, 1]))
+            j0 = max(0, int(np.searchsorted(gx, pmx - merc_pad)) - 1)
+            j1 = min(nx - 1, int(np.searchsorted(gx, pmx + merc_pad)) + 1)
+            i0 = max(0, int(np.searchsorted(gy, pmy - merc_pad)) - 1)
+            i1 = min(ny - 1, int(np.searchsorted(gy, pmy + merc_pad)) + 1)
+            sub_wwx = WWx[i0 : i1 + 1, j0 : j1 + 1]
+            sub_wwy = WWy[i0 : i1 + 1, j0 : j1 + 1]
+            ddx = sub_wwx - pw_x
+            ddy = sub_wwy - pw_y
+            distm = np.hypot(ddx, ddy)
+            ang = np.arctan2(ddy, ddx) - ph
+            ang = _wrap_pi(ang)
+            m = (distm <= r_m) & (distm >= 1e-3) & (np.abs(ang) <= half)
+            slc = (slice(i0, i1 + 1), slice(j0, j1 + 1))
+            sub = last_scan[slc]
+            last_scan[slc] = np.where(m, np.maximum(sub, stamp), sub)
+
+    geom_cov = cov_geom_3857
+    try:
+        from shapely import vectorized
+
+        ins = vectorized.contains(geom_cov, Wx, Wy)
+        if hasattr(vectorized, "touches"):
+            ins = ins | vectorized.touches(geom_cov, Wx, Wy)
+    except Exception:
+        from shapely.geometry import Point
+        from shapely.prepared import prep
+
+        prep_c = prep(geom_cov)
+        ins = np.zeros((ny, nx), dtype=bool)
+        for r in range(ny):
+            for c in range(nx):
+                ins[r, c] = prep_c.covers(Point(float(Wx[r, c]), float(Wy[r, c])))
+    never_in_cov = ins & (last_scan < -1e90)
+
+    last_plot = np.full_like(last_scan, np.nan, dtype=np.float64)
+    hit = ins & (last_scan > -1e90)
+    last_plot[hit] = last_scan[hit]
+    last_plot[never_in_cov] = 0.0
+
+    if not np.any(np.isfinite(last_plot)):
+        if stamp_debug_path is not None:
+            stamp_debug_path.write_text(
+                "status=FAIL\nreason=no finite last_plot values after mask\n",
+                encoding="utf-8",
+            )
+        return None
+
+    ft = max(final_t, 1.0)
+    rgba = _sim_time_grid_to_rgba_turbo(last_plot, vmin=0.0, vmax=ft)
+
+    if stamp_debug_path is not None:
+        lines = [
+            "NOTE: Green Folium coverage = always-on sector wedges along the resampled route.",
+            "It is NOT gated by policy camera_on. Policy map-age uses camera_on_effective unless",
+            "the HTML builder falls back to always-on when the policy never stamps (n_hit=0).",
+            "",
+            "status=OK",
+            f"mode={'always_on_reference' if always_on_reference else 'policy'}",
+            f"final_sim_time_s={final_t}",
+            f"dt_s={dt_s}",
+            f"nseg={nseg}",
+            f"nx={nx} ny={ny}",
+            "",
+            "Per segment k: camera_on (1=yes), stamp_sim_s = sim clock at START of interval k "
+            "(same as env when applying sector; policy uses sim_time_s[k]-dt_s).",
+            "When camera off, stamp is still listed but not applied to the raster.",
+            "",
+        ]
+        for k in range(nseg):
+            lines.append(f"k={k}\tcamera_on={int(on[k])}\tstamp_sim_s={float(stamps[k]):.6g}")
+        lines.append("")
+        if not np.any(on):
+            lines.append(
+                "WARNING: camera_on is 0 for every segment — no stamps are written, "
+                "so last_plot is only discretization fill (0) and the heatmap is uniform."
+            )
+            lines.append("")
+        lv = last_plot[np.isfinite(last_plot)]
+        hit_m = hit & np.isfinite(last_plot)
+        z_m = never_in_cov
+        lines.append(
+            f"raster cells: total={nx * ny} inside_cov={int(np.sum(ins))} "
+            f"hit_by_sector={int(np.sum(hit_m))} never_hit_fill0={int(np.sum(z_m))} "
+            f"outside_cov={int(nx * ny - np.sum(ins))}"
+        )
+        if lv.size:
+            lines.append(
+                f"last_plot (sim_s used for turbo color, 0=discretization gap): "
+                f"min={float(np.nanmin(lv)):.6g} max={float(np.nanmax(lv)):.6g} "
+                f"mean={float(np.nanmean(lv)):.6g} p5={float(np.percentile(lv, 5)):.6g} "
+                f"p95={float(np.percentile(lv, 95)):.6g}"
+            )
+        lines.append("")
+        lines.append(f"turbo_vmin=0 turbo_vmax={ft}")
+        stamp_debug_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp_debug_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    t4326 = Transformer.from_crs(3857, 4326, always_xy=True)
+    lons, lats = t4326.transform(
+        [xmin, xmax, xmax, xmin],
+        [ymin, ymin, ymax, ymax],
+    )
     w, e = min(lons), max(lons)
     s, nlat = min(lats), max(lats)
-    return rgba, (w, s, e, nlat)
+    n_hit = int(np.sum(hit))
+    return rgba, (w, s, e, nlat), n_hit
 
 
 def _save_coverage_mpl_png(
@@ -577,8 +967,14 @@ def try_save_realworld_always_on_coverage(
     Writes:
       1) ``*_coverage_realworld.png`` — full place/bbox extent, sharp OSM tiles
       2) ``*_coverage_realworld_zoom.png`` — cropped around the route
-      3) ``*_coverage_realworld_map.html`` — Folium (if ``folium`` installed): path, coverage,
-         optional map-age raster over the zoom extent (toggle layers, scroll zoom).
+      3) ``*_coverage_realworld_map.html`` — Folium (if ``folium`` installed): path,
+         **always-on** coverage (green), **policy** coverage when camera on (blue), optional
+         **map-age raster** (``turbo``).
+
+    **Coverage vs map age:** the green union is **always-on** wedges along the resampled route
+    (``repeat_path=False``); it does **not** read ``camera_on_effective``. The heatmap uses the
+    policy’s camera first; if the policy never turns the camera on (``n_hit==0``), the HTML
+    layer falls back to the same **always-on** stamping as the coverage footprint.
 
     Returns ``(full_png, zoom_png, html_or_none)`` or ``None`` if prerequisites missing.
     """
@@ -638,13 +1034,17 @@ def try_save_realworld_always_on_coverage(
 
     wedges: list = []
     for i in range(0, n_scan, stride):
-        wedges.append(
-            _sector_wedge_polygon(
+        wedges.extend(
+            _wedge_polygons_motion_segment_utm(
                 float(x[i]),
                 float(y[i]),
                 float(h[i]),
-                r_m,
-                float(cfg.hfov_deg),
+                float(x[i + 1]),
+                float(y[i + 1]),
+                float(h[i + 1]),
+                radius_m=r_m,
+                hfov_deg=float(cfg.hfov_deg),
+                resolution_m=float(cfg.resolution_m),
             )
         )
     coverage_utm = unary_union(wedges)
@@ -658,10 +1058,11 @@ def try_save_realworld_always_on_coverage(
     z_full = _tile_zoom_for_bounds_3857(mx0, my0, mx1, my1, max_tiles=280)
     z_crop = _tile_zoom_for_bounds_3857(zx0, zy0, zx1, zy1, max_tiles=56)
 
-    stride_note = f", wedge union stride={stride}" if stride > 1 else ""
+    stride_note = f", segment stride={stride}" if stride > 1 else ""
     base_title = (
-        f"Always-on: {cfg.hfov_deg:.0f}° × {cfg.scan_radius_m:.0f} m (UTM wedges), "
-        f"EPSG:3857 map — {n_scan} steps @ dt={cfg.dt_s:.0f}s{stride_note}  |  {rec.get('trajectory_source', '')}"
+        f"Always-on (motion-integrated wedges / {cfg.dt_s:.0f}s step): "
+        f"{cfg.hfov_deg:.0f}° × {cfg.scan_radius_m:.0f} m, EPSG:3857 — "
+        f"{n_scan} steps{stride_note}  |  {rec.get('trajectory_source', '')}"
     )
 
     _save_coverage_mpl_png(
@@ -697,18 +1098,120 @@ def try_save_realworld_always_on_coverage(
     try:
         from adaptive_scanning.interactive_map import save_realworld_folium_html
 
-        age_rgba, age_bounds = _norm_age_rgba_utm(
-            x,
-            y,
-            h,
-            n_scan,
-            r_m,
-            float(cfg.hfov_deg),
-            utm_crs,
+        stamp_txt = out_html.parent / f"{out_html.stem}_stamps.txt"
+
+        world_w_m = float(cfg.nx) * float(cfg.resolution_m)
+        world_h_m = float(cfg.ny) * float(cfg.resolution_m)
+        xs_a = np.asarray(xs, dtype=np.float64)
+        ys_a = np.asarray(rec["ys"], dtype=np.float64)
+        n_path = int(xs_a.shape[0])
+        hs = rec.get("traj_heading_rad")
+        if hs is not None and int(np.asarray(hs).size) == n_path:
+            h_pol = np.asarray(hs, dtype=np.float64).ravel()[:n_path]
+        elif n_path >= 2:
+            h_pol = np.empty(n_path, dtype=np.float64)
+            for ii in range(n_path - 1):
+                h_pol[ii] = math.atan2(
+                    float(ys_a[ii + 1] - ys_a[ii]),
+                    float(xs_a[ii + 1] - xs_a[ii]),
+                )
+            h_pol[-1] = h_pol[-2]
+        else:
+            h_pol = np.zeros(max(1, n_path), dtype=np.float64)
+
+        def _reference_sector_age_pack():
+            ref_g = gpd.GeoDataFrame(
+                geometry=gpd.points_from_xy(
+                    np.asarray(x, dtype=np.float64),
+                    np.asarray(y, dtype=np.float64),
+                ),
+                crs=utm_crs,
+            ).to_crs(str(crs))
+            xg = np.asarray(ref_g.geometry.x, dtype=np.float64)
+            yg = np.asarray(ref_g.geometry.y, dtype=np.float64)
+            xyw_ref = _graph_xy_to_world_xy(
+                np.asarray(poly, dtype=np.float64),
+                np.column_stack([xg, yg]),
+                world_w_m=world_w_m,
+                world_h_m=world_h_m,
+                margin=1.0,
+            )
+            xw_ref = xyw_ref[:, 0]
+            yw_ref = xyw_ref[:, 1]
+            n_ref = int(xw_ref.shape[0])
+            if n_ref >= 2:
+                h_ref = np.empty(n_ref, dtype=np.float64)
+                for ii in range(n_ref - 1):
+                    h_ref[ii] = math.atan2(
+                        float(yg[ii + 1] - yg[ii]),
+                        float(xg[ii + 1] - xg[ii]),
+                    )
+                h_ref[-1] = h_ref[-2]
+            else:
+                h_ref = np.zeros(max(1, n_ref), dtype=np.float64)
+            return _sector_scan_age_rgba_wgs84(
+                rec,
+                cov_geom,
+                (zx0, zy0, zx1, zy1),
+                always_on_reference=True,
+                xw_path=xw_ref,
+                yw_path=yw_ref,
+                h_path=h_ref,
+                poly=np.asarray(poly, dtype=np.float64),
+                graph_crs=str(crs),
+                world_w_m=world_w_m,
+                world_h_m=world_h_m,
+                stamp_debug_path=stamp_txt,
+            )
+
+        age_pack = _sector_scan_age_rgba_wgs84(
+            rec,
+            cov_geom,
             (zx0, zy0, zx1, zy1),
+            always_on_reference=False,
+            xw_path=xs_a,
+            yw_path=ys_a,
+            h_path=h_pol,
+            poly=np.asarray(poly, dtype=np.float64),
+            graph_crs=str(crs),
+            world_w_m=world_w_m,
+            world_h_m=world_h_m,
+            stamp_debug_path=stamp_txt,
         )
+        age_layer_name = (
+            "Map age — sim time of last sector scan (policy camera; s from episode start, turbo)"
+        )
+        if age_pack is None:
+            age_pack = _reference_sector_age_pack()
+            age_layer_name = (
+                "Map age — sim time of last sector scan (always-on reference; "
+                "policy raster unavailable)"
+            )
+        else:
+            _a, _b, n_hit = age_pack
+            if n_hit == 0:
+                ap2 = _reference_sector_age_pack()
+                if ap2 is not None:
+                    age_pack = ap2
+                    age_layer_name = (
+                        "Map age — sim time of last scan (always-on, **same as green coverage**; "
+                        "policy had camera_off every step this episode)"
+                    )
+        if age_pack is None:
+            age_rgba, age_bounds = None, None
+        else:
+            age_rgba, age_bounds, _n_hit_out = age_pack
         colored_paths = home_daily_colored_paths_3857(rec)
         extra_fg = folium_feature_groups_home_daily(rec)
+        policy_cov_3857 = _policy_camera_coverage_union_3857(
+            rec,
+            xs_a,
+            ys_a,
+            np.asarray(poly, dtype=np.float64),
+            str(crs),
+            utm_crs,
+            cfg,
+        )
         html_done = save_realworld_folium_html(
             out_path=out_html,
             coverage_3857=cov_geom,
@@ -716,11 +1219,13 @@ def try_save_realworld_always_on_coverage(
             age_rgba=age_rgba,
             age_bounds_wgs84=age_bounds,
             title=(
-                "Open layers: path, coverage, map age (zoom box). "
+                "Open layers: path, coverage (always-on vs policy), map age (zoom box). "
                 "Scroll to zoom, drag to pan — " + base_title
             ),
             colored_path_layers_3857=colored_paths,
             extra_feature_groups=extra_fg,
+            age_layer_name=age_layer_name,
+            policy_coverage_3857=policy_cov_3857,
         )
         if html_done is not None:
             html_path = html_done
@@ -873,13 +1378,18 @@ def try_save_realworld_day_prefix_coverage(
     wedges: list = []
     for j in range(0, len(idx_w), stride):
         k = idx_w[j]
-        wedges.append(
-            _sector_wedge_polygon(
+        k1 = min(k + 1, n - 1)
+        wedges.extend(
+            _wedge_polygons_motion_segment_utm(
                 float(coords[k, 0]),
                 float(coords[k, 1]),
                 float(h_utm[k]),
-                r_m,
-                float(cfg.hfov_deg),
+                float(coords[k1, 0]),
+                float(coords[k1, 1]),
+                float(h_utm[k1]),
+                radius_m=r_m,
+                hfov_deg=float(cfg.hfov_deg),
+                resolution_m=float(cfg.resolution_m),
             )
         )
     coverage_utm = unary_union(wedges)
@@ -1392,6 +1902,7 @@ def policy_from_name(name: str, *, seed: int = 0) -> Policy:
 def visualize_episode(
     cfg: AdaptiveScanningConfig,
     *,
+    policy: Policy | None = None,
     policy_name: str = "random",
     seed: int = 0,
     out_path: str | Path = "outputs/adaptive_scanning/episode_preview.png",
@@ -1406,13 +1917,18 @@ def visualize_episode(
     tuple[Path, Path, Path | None] | None,
 ]:
     env = CameraBudgetEnv(cfg, seed=seed)
-    pol = policy_from_name(policy_name, seed=seed)
+    if policy is not None:
+        pol = policy
+        label = policy_name.strip() or "custom"
+    else:
+        pol = policy_from_name(policy_name, seed=seed)
+        label = policy_name
     rec = record_episode(env, pol, seed=seed)
     out_path = Path(out_path)
     src = str(rec.get("trajectory_source", "?"))
     panel_path: Path | None = None
     if not skip_episode_png:
-        save_episode_figure(rec, out_path, title=f"policy={policy_name} seed={seed}")
+        save_episode_figure(rec, out_path, title=f"policy={label} seed={seed}")
         panel_path = out_path
     basemap_path = try_save_episode_basemap(rec, out_path)
     coverage_pack = try_save_realworld_always_on_coverage(rec, out_path)

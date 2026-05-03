@@ -2,7 +2,9 @@
 CLI for adaptive scanning simulation.
 
   python -m adaptive_scanning.run_sim eval
-  python -m adaptive_scanning.run_sim train --epochs 30
+  python -m adaptive_scanning.run_sim train --epochs 30 --out models/policy.pt
+  # With --out, also writes models/policy_training/{config.json,metrics.jsonl,history.json,training_curves.png}
+  # Override: --train-log-dir PATH | disable: --no-train-log
   python -m adaptive_scanning.run_sim export --out outputs/adaptive_scanning/episodes.npz
   python -m adaptive_scanning.run_sim visualize --fast --policy random --out outputs/adaptive_scanning/preview.png
   python -m adaptive_scanning.run_sim visualize --fast --one-path --out outputs/adaptive_scanning/osm_one_leg.png
@@ -209,6 +211,17 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Disable tqdm epoch progress bar during training",
     )
+    pt.add_argument(
+        "--train-log-dir",
+        type=str,
+        default="",
+        help="Write config.json, metrics.jsonl (one line/epoch), history.json, training_curves.png here",
+    )
+    pt.add_argument(
+        "--no-train-log",
+        action="store_true",
+        help="Disable training logs even when --out would imply a default log directory",
+    )
     _add_street_cli_args(pt)
     _add_home_commute_cli_args(pt)
 
@@ -323,6 +336,15 @@ def main(argv: list[str] | None = None) -> None:
         if vbm_tr > 0.0:
             cfg.seconds_video_budget_per_day = float(vbm_tr) * 60.0
 
+        train_log: str | None = None
+        if not bool(getattr(args, "no_train_log", False)):
+            tld = (getattr(args, "train_log_dir", "") or "").strip()
+            if tld:
+                train_log = tld
+            elif (getattr(args, "out", "") or "").strip():
+                outp = Path(str(args.out).strip())
+                train_log = str(outp.parent / f"{outp.stem}_training")
+
         pol, result = train_reinforce(
             cfg,
             epochs=args.epochs,
@@ -330,8 +352,11 @@ def main(argv: list[str] | None = None) -> None:
             lr=args.lr,
             seed=args.seed,
             show_progress=not bool(getattr(args, "no_train_progress", False)),
+            log_dir=train_log,
         )
         print("last_epoch", json.dumps(result.history[-1] if result.history else {}, indent=2))
+        if train_log:
+            print("training_log_dir", train_log)
         if args.out:
             save_policy(args.out, pol, cfg)
             print("saved", args.out)

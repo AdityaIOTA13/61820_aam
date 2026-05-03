@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -12,6 +14,31 @@ from adaptive_scanning.config import AdaptiveScanningConfig
 from adaptive_scanning.env import CameraBudgetEnv
 from adaptive_scanning.rollout import eval_policy
 from adaptive_scanning.policies import Policy
+
+# region agent log
+_DBG_LOG_PATH = Path(__file__).resolve().parent.parent / "debug-edc71f.log"
+_DBG_SESSION = "edc71f"
+
+
+def _dbg_ndjson(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+    import time
+
+    rec = {
+        "sessionId": _DBG_SESSION,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(_DBG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+# endregion agent log
 
 
 class MLPPolicy(nn.Module, Policy):
@@ -26,16 +53,61 @@ class MLPPolicy(nn.Module, Policy):
             nn.Tanh(),
             nn.Linear(hidden, 2),
         )
+        self._dbg_act_idx = 0
 
     def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
     def act(self, obs: np.ndarray, info: dict) -> int:
         dev = next(self.parameters()).device
+        self._dbg_act_idx += 1
+        idx = self._dbg_act_idx
         with torch.no_grad():
             x = torch.from_numpy(obs).float().unsqueeze(0).to(dev)
             logits = self.forward_logits(x)
-            return int(torch.argmax(logits, dim=-1).item())
+            lo = logits.detach().cpu().float().numpy().ravel()
+            a = int(torch.argmax(logits, dim=-1).item())
+            # region agent log
+            if idx <= 35 or idx % 800 == 0:
+                o = np.asarray(obs, dtype=np.float64)
+                _dbg_ndjson(
+                    "H1",
+                    "training.py:MLPPolicy.act",
+                    "greedy_argmax",
+                    {
+                        "act_call_idx": idx,
+                        "logit_action0_off": float(lo[0]),
+                        "logit_action1_on": float(lo[1]),
+                        "logit_diff_on_minus_off": float(lo[1] - lo[0]),
+                        "argmax_action": a,
+                    },
+                )
+                _dbg_ndjson(
+                    "H2",
+                    "training.py:MLPPolicy.act",
+                    "obs_health",
+                    {
+                        "act_call_idx": idx,
+                        "obs_all_finite": bool(np.isfinite(o).all()),
+                        "obs_nan_count": int(np.isnan(o).sum()),
+                        "obs_inf_count": int(np.isinf(o).sum()),
+                    },
+                )
+                _dbg_ndjson(
+                    "H4",
+                    "training.py:MLPPolicy.act",
+                    "obs_scale",
+                    {
+                        "act_call_idx": idx,
+                        "obs_mean": float(np.mean(o)),
+                        "obs_std": float(np.std(o)),
+                        "obs_min": float(np.min(o)),
+                        "obs_max": float(np.max(o)),
+                        "obs_shape": list(o.shape),
+                    },
+                )
+            # endregion agent log
+            return a
 
     def act_stochastic(self, obs: np.ndarray) -> tuple[int, torch.Tensor]:
         dev = next(self.parameters()).device
@@ -61,6 +133,81 @@ class TrainResult:
     history: list[dict[str, float]]
 
 
+def _config_json_safe(cfg: AdaptiveScanningConfig) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in cfg.__dict__.items():
+        if isinstance(v, tuple):
+            out[k] = list(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _training_log_start(log_dir: Path, meta: dict[str, Any]) -> None:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with (log_dir / "config.json").open("w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    (log_dir / "metrics.jsonl").unlink(missing_ok=True)
+
+
+def _training_log_epoch(log_dir: Path, epoch: int, row: dict[str, float]) -> None:
+    payload = {"epoch": epoch, **row}
+    with (log_dir / "metrics.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload) + "\n")
+
+
+def _training_log_finish(log_dir: Path, history: list[dict[str, float]]) -> None:
+    rows = [{"epoch": i + 1, **h} for i, h in enumerate(history)]
+    with (log_dir / "history.json").open("w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2)
+    _write_training_curves_png(log_dir, rows)
+
+
+def _write_training_curves_png(log_dir: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ep = [int(r["epoch"]) for r in rows]
+    loss = [float(r["loss"]) for r in rows]
+    ret = [float(r["return_mean"]) for r in rows]
+    unc = [float(r["uncovered_mean"]) for r in rows]
+    st = [float(r["stale_mean"]) for r in rows]
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7), constrained_layout=True)
+    ax0, ax1, ax2, ax3 = axes.flat
+
+    ax0.plot(ep, loss, color="C0", linewidth=1.2)
+    ax0.set_xlabel("epoch")
+    ax0.set_ylabel("policy loss (REINFORCE)")
+    ax0.set_title("Loss")
+    ax0.set_yscale("symlog", linthresh=1e-6)
+
+    ax1.plot(ep, ret, color="C1", linewidth=1.2)
+    ax1.set_xlabel("epoch")
+    ax1.set_ylabel("mean total return (eval)")
+    ax1.set_title("Eval return")
+
+    ax2.plot(ep, unc, color="C2", linewidth=1.2)
+    ax2.set_xlabel("epoch")
+    ax2.set_ylabel("uncovered fraction")
+    ax2.set_title("Eval uncovered (lower is better)")
+    ax2.set_ylim(0.0, 1.05)
+
+    ax3.plot(ep, st, color="C3", linewidth=1.2)
+    ax3.set_xlabel("epoch")
+    ax3.set_ylabel("mean stale (normalized)")
+    ax3.set_title("Eval staleness")
+
+    fig.suptitle("REINFORCE training curves", fontsize=12)
+    out = log_dir / "training_curves.png"
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+
+
 def train_reinforce(
     cfg: AdaptiveScanningConfig,
     *,
@@ -71,6 +218,7 @@ def train_reinforce(
     seed: int = 0,
     device: str | None = None,
     show_progress: bool = True,
+    log_dir: str | Path | None = None,
 ) -> tuple[MLPPolicy, TrainResult]:
     torch.manual_seed(seed)
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -80,6 +228,21 @@ def train_reinforce(
     opt = optim.Adam(policy.parameters(), lr=lr)
     rng = np.random.default_rng(seed)
     history: list[dict[str, float]] = []
+
+    log_path: Path | None = Path(log_dir) if log_dir else None
+    if log_path is not None:
+        _training_log_start(
+            log_path,
+            {
+                "seed": seed,
+                "epochs": epochs,
+                "episodes_per_epoch": episodes_per_epoch,
+                "lr": lr,
+                "gamma": gamma,
+                "device": dev,
+                "config": _config_json_safe(cfg),
+            },
+        )
 
     tqdm_mod: Any = None
     if show_progress:
@@ -157,14 +320,15 @@ def train_reinforce(
             pbar.refresh()
         with torch.no_grad():
             metrics = eval_policy(env, policy, n_episodes=4, seed0=ep + 1000)
-        history.append(
-            {
-                "loss": float(loss.item()),
-                "return_mean": metrics["return_mean"],
-                "uncovered_mean": metrics["uncovered_mean"],
-                "stale_mean": metrics["stale_mean"],
-            }
-        )
+        row = {
+            "loss": float(loss.item()),
+            "return_mean": metrics["return_mean"],
+            "uncovered_mean": metrics["uncovered_mean"],
+            "stale_mean": metrics["stale_mean"],
+        }
+        history.append(row)
+        if log_path is not None:
+            _training_log_epoch(log_path, ep + 1, row)
         if pbar is not None:
             pbar.set_postfix(
                 loss=f"{float(loss.item()):.4f}",
@@ -174,6 +338,9 @@ def train_reinforce(
 
     if pbar is not None:
         pbar.close()
+
+    if log_path is not None and history:
+        _training_log_finish(log_path, history)
 
     return policy, TrainResult(history=history)
 
@@ -193,4 +360,24 @@ def load_policy(path: str, device: str | None = None) -> tuple[MLPPolicy, Adapti
     pol = MLPPolicy(env.observation_dim).to(dev)
     pol.load_state_dict(ckpt["state_dict"])
     pol.eval()
+    # region agent log
+    with torch.no_grad():
+        last = pol.net[-1]
+        assert isinstance(last, nn.Linear)
+        W = last.weight.detach().cpu().float()
+        b = last.bias.detach().cpu().float() if last.bias is not None else None
+        _dbg_ndjson(
+            "H6",
+            "training.py:load_policy",
+            "last_linear_head",
+            {
+                "weight_row0_mean": float(W[0].mean()),
+                "weight_row1_mean": float(W[1].mean()),
+                "weight_row0_absmean": float(W[0].abs().mean()),
+                "weight_row1_absmean": float(W[1].abs().mean()),
+                "bias0_off": float(b[0]) if b is not None else None,
+                "bias1_on": float(b[1]) if b is not None else None,
+            },
+        )
+    # endregion agent log
     return pol, cfg

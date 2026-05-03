@@ -25,13 +25,17 @@ def save_realworld_folium_html(
     title: str = "Coverage explorer",
     extra_feature_groups: list[Any] | None = None,
     colored_path_layers_3857: list[tuple[str, str, Any]] | None = None,
+    age_layer_name: str = "",
+    policy_coverage_3857: Any | None = None,
 ) -> Path | None:
     """
     Write a self-contained HTML map with layer control (path, coverage, optional age).
 
     ``coverage_3857`` / ``path_line_3857``: shapely geometry in EPSG:3857 metres.
-    ``age_rgba``: uint8 (H, W, 4) with alpha 0 where no data; ``age_bounds_wgs84`` is
-    (west, south, east, north) in degrees for the overlay corners.
+    ``policy_coverage_3857``: optional union of sector wedges **only** when the policy had the
+    camera on (same construction as always-on coverage, filtered by ``camera_on_effective``).
+    ``age_rgba``: uint8 (H, W, 4) heatmap (e.g. sim-time staleness); alpha 0 where no data.
+    ``age_bounds_wgs84`` is (west, south, east, north) in degrees for the overlay corners.
     If ``colored_path_layers_3857`` is set, each ``(layer_name, color_hex, linestring_3857)`` is drawn
     instead of the single ``path_line_3857`` layer (bounds still include coverage + all paths).
     """
@@ -49,6 +53,10 @@ def save_realworld_folium_html(
     cov = gpd.GeoDataFrame(geometry=[coverage_3857], crs=3857).to_crs(4326)
     if colored_path_layers_3857:
         geoms3857 = [coverage_3857]
+        if policy_coverage_3857 is not None and not getattr(
+            policy_coverage_3857, "is_empty", True
+        ):
+            geoms3857.append(policy_coverage_3857)
         for _name, _col, g in colored_path_layers_3857:
             geoms3857.append(g)
         bb = gpd.GeoDataFrame(geometry=geoms3857, crs=3857).to_crs(4326)
@@ -66,8 +74,20 @@ def save_realworld_folium_html(
         tiles="OpenStreetMap",
         control_scale=True,
     )
+    # Nearest-neighbor when the browser scales the raster (sharp grid / pixel look).
+    m.get_root().header.add_child(
+        Element(
+            "<style>"
+            ".leaflet-overlay-pane img.leaflet-image-layer{"
+            "image-rendering:pixelated;image-rendering:crisp-edges;"
+            "image-rendering:-moz-crisp-edges;}"
+            "</style>"
+        )
+    )
 
-    fg_cov = folium.FeatureGroup(name="Coverage (always-on union)", show=True)
+    fg_cov = folium.FeatureGroup(
+        name="Coverage — always-on (full walk, not policy-gated)", show=True
+    )
     folium.GeoJson(
         cov.to_json(),
         style_function=lambda _f: {
@@ -78,6 +98,20 @@ def save_realworld_folium_html(
         },
     ).add_to(fg_cov)
     fg_cov.add_to(m)
+
+    if policy_coverage_3857 is not None and not getattr(policy_coverage_3857, "is_empty", True):
+        pol_cov = gpd.GeoDataFrame(geometry=[policy_coverage_3857], crs=3857).to_crs(4326)
+        fg_pol = folium.FeatureGroup(name="Coverage — policy camera on only", show=True)
+        folium.GeoJson(
+            pol_cov.to_json(),
+            style_function=lambda _f: {
+                "fillColor": "#3498db",
+                "color": "#1b4f72",
+                "weight": 2,
+                "fillOpacity": 0.52,
+            },
+        ).add_to(fg_pol)
+        fg_pol.add_to(m)
 
     if colored_path_layers_3857:
         for layer_name, col_hex, geom3857 in colored_path_layers_3857:
@@ -109,13 +143,15 @@ def save_realworld_folium_html(
     if age_rgba is not None and age_bounds_wgs84 is not None:
         aw, as_, ae, an = age_bounds_wgs84
         img = np.flipud(age_rgba)
-        fg_age = folium.FeatureGroup(name="Map age (zoom area)", show=False)
+        age_name = age_layer_name.strip() or "Map age — staleness at episode end (sim grid, seconds)"
+        fg_age = folium.FeatureGroup(name=age_name, show=True)
         ImageOverlay(
             image=img,
             bounds=[[as_, aw], [an, ae]],
-            opacity=0.55,
+            opacity=0.62,
             interactive=True,
             cross_origin=False,
+            zindex=650,
         ).add_to(fg_age)
         fg_age.add_to(m)
 
