@@ -199,6 +199,12 @@ def main(argv: list[str] | None = None) -> None:
     pt.add_argument("--episodes-per-epoch", type=int, default=8)
     pt.add_argument("--lr", type=float, default=3e-4)
     pt.add_argument("--seed", type=int, default=0)
+    pt.add_argument(
+        "--entropy-coef",
+        type=float,
+        default=0.03,
+        help="REINFORCE entropy bonus (maximize H); use 0 to disable. Helps avoid always-off collapse.",
+    )
     pt.add_argument("--out", type=str, default="", help="Optional path to save policy .pt")
     pt.add_argument(
         "--video-budget-minutes-per-day",
@@ -350,6 +356,7 @@ def main(argv: list[str] | None = None) -> None:
             epochs=args.epochs,
             episodes_per_epoch=args.episodes_per_epoch,
             lr=args.lr,
+            entropy_coef=float(getattr(args, "entropy_coef", 0.03)),
             seed=args.seed,
             show_progress=not bool(getattr(args, "no_train_progress", False)),
             log_dir=train_log,

@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import json
 import math
-import time
 import warnings
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -371,36 +368,6 @@ class CameraBudgetEnv:
         on = int(action) == 1
         budget_ok = self._budget_s >= c.dt_s - 1e-9
         actually_on = on and budget_ok
-
-        # region agent log
-        if self._step_idx < 45:
-            _p = Path(__file__).resolve().parent.parent / "debug-edc71f.log"
-            try:
-                with open(_p, "a", encoding="utf-8") as f:
-                    f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "edc71f",
-                                "hypothesisId": "H5",
-                                "location": "env.py:CameraBudgetEnv.step",
-                                "message": "action_vs_budget",
-                                "data": {
-                                    "step_idx": int(self._step_idx),
-                                    "action": int(action),
-                                    "on_requested": bool(on),
-                                    "budget_ok": bool(budget_ok),
-                                    "budget_s": float(self._budget_s),
-                                    "dt_s": float(c.dt_s),
-                                    "camera_on_effective": bool(actually_on),
-                                },
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except OSError:
-                pass
-        # endregion agent log
 
         if actually_on:
             self._apply_sector_while_moving(ax0, ay0, hd0, ax1, ay1, hd1, stamp)
