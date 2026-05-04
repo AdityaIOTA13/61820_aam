@@ -378,6 +378,9 @@ class CameraBudgetEnv:
 
         self._step_idx += 1
         reward = self._reward()
+        bonus = float(getattr(c, "reward_camera_on_bonus", 0.0))
+        if actually_on and bonus != 0.0:
+            reward += bonus
 
         max_steps = len(self._traj_x) - 1
         truncated = self._step_idx >= max_steps

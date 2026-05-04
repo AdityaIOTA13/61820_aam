@@ -33,6 +33,8 @@ class AdaptiveScanningConfig:
     w_uncovered: float = 1.0
     w_stale_scanned: float = 0.5
     stale_ref_s: float = 3600.0  # normalize ages for observation / local stale mean cap
+    # Added to reward each step the camera is effectively on (RL bootstrap; 0 = pure coverage objective).
+    reward_camera_on_bonus: float = 0.0
 
     # Local egocentric patch (cells); must be odd
     patch_cells: int = 31

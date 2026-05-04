@@ -28,6 +28,11 @@ class MLPPolicy(nn.Module, Policy):
             nn.Tanh(),
             nn.Linear(hidden, 2),
         )
+        # Slight symmetry break toward "camera on" so early REINFORCE rollouts see coverage signal.
+        with torch.no_grad():
+            b = self.net[-1].bias
+            if b is not None:
+                b[1] += 0.15
 
     def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -154,7 +159,7 @@ def train_reinforce(
     episodes_per_epoch: int = 8,
     lr: float = 3e-4,
     gamma: float = 0.995,
-    entropy_coef: float = 0.03,
+    entropy_coef: float = 0.1,
     seed: int = 0,
     device: str | None = None,
     show_progress: bool = True,
@@ -211,8 +216,8 @@ def train_reinforce(
             pbar.refresh()
         opt.zero_grad()
         batch_logp: list[torch.Tensor] = []
-        batch_ret: list[torch.Tensor] = []
         batch_entr: list[torch.Tensor] = []
+        episode_g0: list[float] = []
         inner_it = range(episodes_per_epoch)
         if tqdm_mod is not None:
             inner_it = tqdm_mod(
@@ -242,9 +247,8 @@ def train_reinforce(
                 if step.terminated or step.truncated:
                     break
             returns = _discounted_returns(rews, gamma)
-            returns_t = torch.tensor(returns, dtype=torch.float32, device=dev)
+            episode_g0.append(float(returns[0]))
             batch_logp.append(torch.stack(logps))
-            batch_ret.append(returns_t)
             batch_entr.append(torch.stack(entrs))
 
         if not batch_logp:
@@ -254,8 +258,14 @@ def train_reinforce(
             pbar.refresh()
         logp_stack = torch.cat(batch_logp)
         entr_stack = torch.cat(batch_entr)
-        ret_raw = torch.cat(batch_ret)
-        ret_stack = (ret_raw - ret_raw.mean()) / (ret_raw.std() + 1e-6)
+        g0_t = torch.tensor(episode_g0, dtype=torch.float32, device=dev)
+        g0_std = float(g0_t.std().item())
+        if g0_std < 1e-5:
+            g0_n = torch.zeros_like(g0_t)
+        else:
+            g0_n = (g0_t - g0_t.mean()) / (g0_t.std() + 1e-6)
+        adv_chunks = [torch.full_like(lp, g0_n[i]) for i, lp in enumerate(batch_logp)]
+        ret_stack = torch.cat(adv_chunks)
         loss_pg = -(logp_stack * ret_stack).mean()
         loss = loss_pg - entropy_coef * entr_stack.mean()
         loss.backward()

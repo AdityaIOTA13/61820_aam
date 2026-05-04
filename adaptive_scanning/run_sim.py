@@ -202,8 +202,14 @@ def main(argv: list[str] | None = None) -> None:
     pt.add_argument(
         "--entropy-coef",
         type=float,
-        default=0.03,
+        default=0.1,
         help="REINFORCE entropy bonus (maximize H); use 0 to disable. Helps avoid always-off collapse.",
+    )
+    pt.add_argument(
+        "--camera-on-bonus",
+        type=float,
+        default=0.06,
+        help="Extra reward per env step when camera is effectively on (RL bootstrap). 0 disables.",
     )
     pt.add_argument("--out", type=str, default="", help="Optional path to save policy .pt")
     pt.add_argument(
@@ -342,6 +348,8 @@ def main(argv: list[str] | None = None) -> None:
         if vbm_tr > 0.0:
             cfg.seconds_video_budget_per_day = float(vbm_tr) * 60.0
 
+        cfg.reward_camera_on_bonus = float(getattr(args, "camera_on_bonus", 0.06))
+
         train_log: str | None = None
         if not bool(getattr(args, "no_train_log", False)):
             tld = (getattr(args, "train_log_dir", "") or "").strip()
@@ -356,7 +364,7 @@ def main(argv: list[str] | None = None) -> None:
             epochs=args.epochs,
             episodes_per_epoch=args.episodes_per_epoch,
             lr=args.lr,
-            entropy_coef=float(getattr(args, "entropy_coef", 0.03)),
+            entropy_coef=float(getattr(args, "entropy_coef", 0.1)),
             seed=args.seed,
             show_progress=not bool(getattr(args, "no_train_progress", False)),
             log_dir=train_log,
