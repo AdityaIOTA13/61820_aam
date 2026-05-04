@@ -26,18 +26,21 @@ def save_realworld_folium_html(
     extra_feature_groups: list[Any] | None = None,
     colored_path_layers_3857: list[tuple[str, str, Any]] | None = None,
     age_layer_name: str = "",
-    policy_coverage_3857: Any | None = None,
+    per_day_coverage_layers_3857: list[tuple[str, str, Any]] | None = None,
+    policy_coverage_layers_3857: list[tuple[str, str, Any]] | None = None,
 ) -> Path | None:
     """
     Write a self-contained HTML map with layer control (path, coverage, optional age).
 
     ``coverage_3857`` / ``path_line_3857``: shapely geometry in EPSG:3857 metres.
-    ``policy_coverage_3857``: optional union of sector wedges **only** when the policy had the
-    camera on (same construction as always-on coverage, filtered by ``camera_on_effective``).
+    ``policy_coverage_layers_3857``: optional per-day wedge unions (camera on only), same GeoJSON
+    style family as always-on coverage.
     ``age_rgba``: uint8 (H, W, 4) heatmap (e.g. sim-time staleness); alpha 0 where no data.
     ``age_bounds_wgs84`` is (west, south, east, north) in degrees for the overlay corners.
     If ``colored_path_layers_3857`` is set, each ``(layer_name, color_hex, linestring_3857)`` is drawn
     instead of the single ``path_line_3857`` layer (bounds still include coverage + all paths).
+    ``per_day_coverage_layers_3857``: optional ``(layer_name, color_hex, polygon_3857)`` always-on
+    wedge unions per calendar day (home-daily playback); semi-transparent fills show cross-day overlap.
     """
     try:
         import folium
@@ -53,10 +56,12 @@ def save_realworld_folium_html(
     cov = gpd.GeoDataFrame(geometry=[coverage_3857], crs=3857).to_crs(4326)
     if colored_path_layers_3857:
         geoms3857 = [coverage_3857]
-        if policy_coverage_3857 is not None and not getattr(
-            policy_coverage_3857, "is_empty", True
-        ):
-            geoms3857.append(policy_coverage_3857)
+        if per_day_coverage_layers_3857:
+            for _name, _col, g in per_day_coverage_layers_3857:
+                geoms3857.append(g)
+        if policy_coverage_layers_3857:
+            for _name, _col, g in policy_coverage_layers_3857:
+                geoms3857.append(g)
         for _name, _col, g in colored_path_layers_3857:
             geoms3857.append(g)
         bb = gpd.GeoDataFrame(geometry=geoms3857, crs=3857).to_crs(4326)
@@ -67,6 +72,16 @@ def save_realworld_folium_html(
         w1, s1, e1, n1 = path.total_bounds
         w, s = min(w0, w1), min(s0, s1)
         e, nlat = max(e0, e1), max(n0, n1)
+        if per_day_coverage_layers_3857:
+            for _n, _c, g in per_day_coverage_layers_3857:
+                b = gpd.GeoDataFrame(geometry=[g], crs=3857).to_crs(4326).total_bounds
+                w, s = min(w, b[0]), min(s, b[1])
+                e, nlat = max(e, b[2]), max(nlat, b[3])
+        if policy_coverage_layers_3857:
+            for _n, _c, g in policy_coverage_layers_3857:
+                b = gpd.GeoDataFrame(geometry=[g], crs=3857).to_crs(4326).total_bounds
+                w, s = min(w, b[0]), min(s, b[1])
+                e, nlat = max(e, b[2]), max(nlat, b[3])
 
     m = folium.Map(
         location=[0.5 * (s + nlat), 0.5 * (w + e)],
@@ -74,13 +89,12 @@ def save_realworld_folium_html(
         tiles="OpenStreetMap",
         control_scale=True,
     )
-    # Nearest-neighbor when the browser scales the raster (sharp grid / pixel look).
+    # Smooth browser scaling for map-age raster (no vector equivalent for the time field).
     m.get_root().header.add_child(
         Element(
             "<style>"
-            ".leaflet-overlay-pane img.leaflet-image-layer{"
-            "image-rendering:pixelated;image-rendering:crisp-edges;"
-            "image-rendering:-moz-crisp-edges;}"
+            ".leaflet-overlay-pane img.aam-map-age-smooth{"
+            "image-rendering:auto;}"
             "</style>"
         )
     )
@@ -99,19 +113,45 @@ def save_realworld_folium_html(
     ).add_to(fg_cov)
     fg_cov.add_to(m)
 
-    if policy_coverage_3857 is not None and not getattr(policy_coverage_3857, "is_empty", True):
-        pol_cov = gpd.GeoDataFrame(geometry=[policy_coverage_3857], crs=3857).to_crs(4326)
-        fg_pol = folium.FeatureGroup(name="Coverage — policy camera on only", show=True)
-        folium.GeoJson(
-            pol_cov.to_json(),
-            style_function=lambda _f: {
-                "fillColor": "#3498db",
-                "color": "#1b4f72",
-                "weight": 2,
-                "fillOpacity": 0.52,
-            },
-        ).add_to(fg_pol)
-        fg_pol.add_to(m)
+    if per_day_coverage_layers_3857:
+        for layer_name, col_hex, geom3857 in per_day_coverage_layers_3857:
+            fg_pd = folium.FeatureGroup(name=layer_name, show=True)
+            pdc = gpd.GeoDataFrame(geometry=[geom3857], crs=3857).to_crs(4326)
+
+            def _mk_cov_style(fill: str) -> Any:
+                def _sf(_feature: Any) -> dict[str, Any]:
+                    return {
+                        "fillColor": fill,
+                        "color": fill,
+                        "weight": 1,
+                        "fillOpacity": 0.4,
+                        "opacity": 0.85,
+                    }
+
+                return _sf
+
+            folium.GeoJson(pdc.to_json(), style_function=_mk_cov_style(col_hex)).add_to(fg_pd)
+            fg_pd.add_to(m)
+
+    if policy_coverage_layers_3857:
+        for layer_name, col_hex, geom3857 in policy_coverage_layers_3857:
+            fg_pc = folium.FeatureGroup(name=layer_name, show=True)
+            pgc = gpd.GeoDataFrame(geometry=[geom3857], crs=3857).to_crs(4326)
+
+            def _mk_pol_style(fill: str) -> Any:
+                def _sf(_feature: Any) -> dict[str, Any]:
+                    return {
+                        "fillColor": fill,
+                        "color": "#1a1a1a",
+                        "weight": 1,
+                        "fillOpacity": 0.38,
+                        "opacity": 0.9,
+                    }
+
+                return _sf
+
+            folium.GeoJson(pgc.to_json(), style_function=_mk_pol_style(col_hex)).add_to(fg_pc)
+            fg_pc.add_to(m)
 
     if colored_path_layers_3857:
         for layer_name, col_hex, geom3857 in colored_path_layers_3857:
@@ -152,6 +192,8 @@ def save_realworld_folium_html(
             interactive=True,
             cross_origin=False,
             zindex=650,
+            pixelated=False,
+            className="aam-map-age-smooth",
         ).add_to(fg_age)
         fg_age.add_to(m)
 

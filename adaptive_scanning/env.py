@@ -290,6 +290,17 @@ class CameraBudgetEnv:
         s = self._mean_stale_normalized()
         return -c.w_uncovered * u - c.w_stale_scanned * s
 
+    def _current_interval_is_moving(self) -> bool:
+        assert self._traj_x is not None
+        assert self._traj_y is not None
+        if self._step_idx >= len(self._traj_x) - 1:
+            return False
+        ax0 = float(self._traj_x[self._step_idx])
+        ay0 = float(self._traj_y[self._step_idx])
+        ax1 = float(self._traj_x[self._step_idx + 1])
+        ay1 = float(self._traj_y[self._step_idx + 1])
+        return math.hypot(ax1 - ax0, ay1 - ay0) > 1e-6
+
     def _observation(self) -> np.ndarray:
         c = self.cfg
         assert self.last_seen is not None
@@ -349,6 +360,7 @@ class CameraBudgetEnv:
             "uncovered_fraction": self._uncovered_fraction(),
             "mean_stale_normalized": self._mean_stale_normalized(),
             "n_scanned_cells": int(np.sum(np.isfinite(self.last_seen))),
+            "interval_is_moving": bool(self._current_interval_is_moving()),
         }
 
     def step(self, action: int) -> StepResult:
@@ -364,10 +376,11 @@ class CameraBudgetEnv:
         ax1 = float(self._traj_x[i1])
         ay1 = float(self._traj_y[i1])
         hd1 = float(self._traj_h[i1])
+        interval_is_moving = math.hypot(ax1 - ax0, ay1 - ay0) > 1e-6
 
         on = int(action) == 1
         budget_ok = self._budget_s >= c.dt_s - 1e-9
-        actually_on = on and budget_ok
+        actually_on = on and budget_ok and interval_is_moving
 
         if actually_on:
             self._apply_sector_while_moving(ax0, ay0, hd0, ax1, ay1, hd1, stamp)
@@ -390,6 +403,7 @@ class CameraBudgetEnv:
         info = self._info_dict()
         info["action_clamped"] = on and not budget_ok
         info["camera_on_effective"] = actually_on
+        info["step_interval_is_moving"] = bool(interval_is_moving)
         info["agent_x_m"] = ax0
         info["agent_y_m"] = ay0
         info["agent_heading_rad"] = hd0

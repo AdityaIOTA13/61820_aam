@@ -21,6 +21,7 @@ def record_episode(
 ) -> dict[str, Any]:
     """Run one episode and return arrays + final last_seen for plotting."""
     obs, info0 = env.reset(seed=seed)
+    info = info0
     traj_src = str(info0.get("trajectory_source", "?"))
     act_req: list[int] = []
     act_eff: list[float] = []
@@ -28,7 +29,10 @@ def record_episode(
     budget: list[float] = []
 
     while True:
-        a = policy.act(obs, {})
+        if bool(info.get("interval_is_moving", True)):
+            a = policy.act(obs, info)
+        else:
+            a = 0
         st = env.step(a)
         inf = st.info
         act_req.append(int(inf["action_requested"]))
@@ -36,6 +40,7 @@ def record_episode(
         sim_t.append(float(inf["sim_time_s"]))
         budget.append(float(inf["budget_s"]))
         obs = st.observation
+        info = inf
         if st.terminated or st.truncated:
             break
 
@@ -359,6 +364,1014 @@ def folium_feature_groups_home_daily(rec: dict[str, Any]) -> list[Any] | None:
     return groups if groups else None
 
 
+def _segment_day_indices_playback(rec: dict[str, Any], nseg: int) -> np.ndarray | None:
+    """
+    Map each motion segment ``k`` to ``playback`` ``day_index`` using segment-start SI time
+    ``sim_time_s[k] - dt_s`` (same clock as map-age stamping).
+
+    Uses **per-day SI bounds** ``[min(t_start_s), max(t_end_s)]`` over all events with that
+    ``day_index`` (days partition wall-clock time). Resolves boundary overlaps by choosing the
+    day whose window **starts** latest among those containing ``t``.
+    """
+    sim_arr = np.asarray(rec.get("sim_time_s"), dtype=np.float64).ravel()
+    if sim_arr.size < nseg or nseg < 1:
+        return None
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    dt_s = float(cfg.dt_s)
+    stamps = sim_arr[:nseg] - dt_s
+
+    pb = rec.get("playback")
+    if not isinstance(pb, dict):
+        return None
+    evs = pb.get("events")
+    if not isinstance(evs, list) or len(evs) < 1:
+        return None
+
+    bounds_m: dict[int, tuple[float, float]] = {}
+    for ev in evs:
+        if ev.get("day_index") is None:
+            continue
+        di = int(ev["day_index"])
+        if di < 0:
+            continue
+        t0 = float(ev.get("t_start_s", 0.0))
+        t1 = float(ev.get("t_end_s", t0))
+        if t1 < t0:
+            t0, t1 = t1, t0
+        if di not in bounds_m:
+            bounds_m[di] = (t0, t1)
+        else:
+            lo, hi = bounds_m[di]
+            bounds_m[di] = (min(lo, t0), max(hi, t1))
+    if not bounds_m:
+        return None
+
+    days_sorted = sorted(bounds_m.keys())
+    out = np.empty(nseg, dtype=np.int32)
+    for k in range(nseg):
+        t = float(stamps[k])
+        cands = [d for d in days_sorted if bounds_m[d][0] - 1e-6 <= t <= bounds_m[d][1] + 1e-6]
+        if len(cands) == 1:
+            out[k] = int(cands[0])
+        elif len(cands) > 1:
+            out[k] = int(max(cands, key=lambda d: bounds_m[d][0]))
+        else:
+            best_d = int(days_sorted[0])
+            best_dist = float("inf")
+            for d in days_sorted:
+                lo, hi = bounds_m[d]
+                mid = 0.5 * (lo + hi)
+                dist = abs(t - mid)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_d = int(d)
+            out[k] = best_d
+    return out
+
+
+def _moving_segment_day_indices_playback(rec: dict[str, Any], nseg: int) -> np.ndarray | None:
+    """
+    Map each **moving-route** segment ``k`` (the same segment stream used by green always-on
+    coverage) to playback ``day_index`` using moving-cumulative time ``k * dt_s``.
+    """
+    if nseg < 1:
+        return None
+    pb = rec.get("playback")
+    if not isinstance(pb, dict):
+        return None
+    evs = pb.get("events")
+    if not isinstance(evs, list) or len(evs) < 1:
+        return None
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    dt_s = float(cfg.dt_s)
+
+    travel: list[tuple[float, float, int]] = []
+    for ev in evs:
+        if str(ev.get("phase")) != "travel":
+            continue
+        if ev.get("day_index") is None:
+            continue
+        di = int(ev["day_index"])
+        m0 = float(ev.get("t_moving_cumulative_at_start_s", 0.0))
+        m1 = float(ev.get("t_moving_cumulative_at_end_s", m0))
+        if m1 < m0:
+            m0, m1 = m1, m0
+        travel.append((m0, m1, di))
+    if not travel:
+        return None
+
+    out = np.empty(nseg, dtype=np.int32)
+    for k in range(nseg):
+        t = float(k) * dt_s
+        cands = [di for m0, m1, di in travel if m0 - 1e-6 <= t <= m1 + 1e-6]
+        if len(cands) == 1:
+            out[k] = int(cands[0])
+        elif len(cands) > 1:
+            best_di = cands[0]
+            best_m0 = -float("inf")
+            for m0, _m1, di in travel:
+                if di in cands and m0 > best_m0:
+                    best_m0 = m0
+                    best_di = di
+            out[k] = int(best_di)
+        else:
+            best_di = int(travel[0][2])
+            best_dist = float("inf")
+            for m0, m1, di in travel:
+                mid = 0.5 * (m0 + m1)
+                dist = abs(t - mid)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_di = int(di)
+            out[k] = best_di
+    return out
+
+
+def _moving_segment_count_from_playback(rec: dict[str, Any], max_nseg: int) -> int | None:
+    """Number of canonical green-route segments that correspond to actual travel time."""
+    if max_nseg < 1:
+        return None
+    pb = rec.get("playback")
+    if not isinstance(pb, dict):
+        return None
+    evs = pb.get("events")
+    if not isinstance(evs, list) or len(evs) < 1:
+        return None
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    dt_s = float(cfg.dt_s)
+    moving_end = 0.0
+    seen = False
+    for ev in evs:
+        if str(ev.get("phase")) != "travel":
+            continue
+        m1 = float(ev.get("t_moving_cumulative_at_end_s", 0.0))
+        moving_end = max(moving_end, m1)
+        seen = True
+    if not seen:
+        return None
+    n_move = int(math.ceil(max(moving_end, 0.0) / max(dt_s, 1e-9)))
+    return max(1, min(max_nseg, n_move))
+
+
+def _canonical_day_segment_indices_from_meta(rec: dict[str, Any], nseg: int) -> np.ndarray | None:
+    """
+    Map canonical green-route segments to day indices using the stored per-day graph polylines.
+
+    This matches the full-walk geometry more directly than wall-clock inference because the green
+    layer is built by resampling the concatenated day polylines once at constant walking speed.
+    """
+    if nseg < 1:
+        return None
+    meta = rec.get("osm_home_daily_meta")
+    if not isinstance(meta, dict):
+        return None
+    polys = meta.get("day_polylines_graph_m")
+    if not isinstance(polys, list) or len(polys) < 1:
+        return None
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    step_m = max(float(cfg.walk_speed_m_s) * float(cfg.dt_s), 1e-9)
+
+    lens: list[float] = []
+    for apoly in polys:
+        arr = np.asarray(apoly, dtype=np.float64)
+        if arr.shape[0] < 2:
+            lens.append(0.0)
+            continue
+        seg = np.diff(arr, axis=0)
+        lens.append(float(np.sum(np.hypot(seg[:, 0], seg[:, 1]))))
+    if not lens:
+        return None
+
+    cum = np.cumsum(np.asarray(lens, dtype=np.float64))
+    out = np.empty(nseg, dtype=np.int32)
+    for k in range(nseg):
+        dist = float(k) * step_m
+        d = int(np.searchsorted(cum, dist + 1e-9, side="right"))
+        out[k] = min(d, len(lens) - 1)
+    return out
+
+
+def _policy_on_moving_segments(rec: dict[str, Any], nseg: int) -> np.ndarray | None:
+    """
+    Boolean mask over the canonical moving-route segment stream used by the green always-on layer.
+
+    A route segment is ON iff its moving-time interval falls inside a travel portion of an episode
+    step where ``camera_on_effective`` was true.
+    """
+    if nseg < 1:
+        return None
+    pb = rec.get("playback")
+    if not isinstance(pb, dict):
+        return None
+    evs = pb.get("events")
+    if not isinstance(evs, list) or len(evs) < 1:
+        return None
+    sim_arr = np.asarray(rec.get("sim_time_s"), dtype=np.float64).ravel()
+    on_ep = np.asarray(rec.get("camera_on_effective"), dtype=np.float64).ravel()
+    if sim_arr.size < 1 or on_ep.size < 1:
+        return None
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    dt_s = float(cfg.dt_s)
+    n_ep = min(sim_arr.size, on_ep.size)
+    out = np.zeros(nseg, dtype=bool)
+
+    travel_evs: list[dict[str, float | int]] = []
+    for ev in evs:
+        if str(ev.get("phase")) != "travel":
+            continue
+        t0 = float(ev.get("t_start_s", 0.0))
+        t1 = float(ev.get("t_end_s", t0))
+        if t1 < t0:
+            t0, t1 = t1, t0
+        m0 = float(ev.get("t_moving_cumulative_at_start_s", 0.0))
+        m1 = float(ev.get("t_moving_cumulative_at_end_s", m0))
+        if m1 < m0:
+            m0, m1 = m1, m0
+        travel_evs.append({"t0": t0, "t1": t1, "m0": m0, "m1": m1})
+    if not travel_evs:
+        return None
+
+    for k in range(n_ep):
+        if not bool(on_ep[k] > 0.5):
+            continue
+        w1 = float(sim_arr[k])
+        w0 = w1 - dt_s
+        for ev in travel_evs:
+            t0 = float(ev["t0"])
+            t1 = float(ev["t1"])
+            ov0 = max(w0, t0)
+            ov1 = min(w1, t1)
+            if ov1 <= ov0 + 1e-9:
+                continue
+            dur = max(t1 - t0, 1e-9)
+            frac0 = (ov0 - t0) / dur
+            frac1 = (ov1 - t0) / dur
+            m0 = float(ev["m0"]) + frac0 * (float(ev["m1"]) - float(ev["m0"]))
+            m1 = float(ev["m0"]) + frac1 * (float(ev["m1"]) - float(ev["m0"]))
+            i0 = max(0, int(math.floor((m0 + 1e-9) / dt_s)))
+            i1 = min(nseg - 1, int(math.ceil((m1 - 1e-9) / dt_s)) - 1)
+            if i1 >= i0:
+                out[i0 : i1 + 1] = True
+    return out
+
+
+def _moving_segment_stamp_times_playback(rec: dict[str, Any], nseg: int) -> np.ndarray | None:
+    """Absolute episode-time stamps for canonical moving-route segment starts."""
+    if nseg < 1:
+        return None
+    pb = rec.get("playback")
+    if not isinstance(pb, dict):
+        return None
+    evs = pb.get("events")
+    if not isinstance(evs, list) or len(evs) < 1:
+        return None
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    dt_s = float(cfg.dt_s)
+
+    travel: list[tuple[float, float, float, float]] = []
+    for ev in evs:
+        if str(ev.get("phase")) != "travel":
+            continue
+        t0 = float(ev.get("t_start_s", 0.0))
+        t1 = float(ev.get("t_end_s", t0))
+        if t1 < t0:
+            t0, t1 = t1, t0
+        m0 = float(ev.get("t_moving_cumulative_at_start_s", 0.0))
+        m1 = float(ev.get("t_moving_cumulative_at_end_s", m0))
+        if m1 < m0:
+            m0, m1 = m1, m0
+        travel.append((m0, m1, t0, t1))
+    if not travel:
+        return None
+
+    out = np.empty(nseg, dtype=np.float64)
+    for k in range(nseg):
+        m = float(k) * dt_s
+        chosen = None
+        for m0, m1, t0, t1 in travel:
+            if m0 - 1e-6 <= m <= m1 + 1e-6:
+                chosen = (m0, m1, t0, t1)
+        if chosen is None:
+            best = min(travel, key=lambda row: abs(m - 0.5 * (row[0] + row[1])))
+            m0, m1, t0, t1 = best
+            frac = 0.0 if m1 <= m0 + 1e-9 else float(np.clip((m - m0) / (m1 - m0), 0.0, 1.0))
+            out[k] = t0 + frac * (t1 - t0)
+            continue
+        m0, m1, t0, t1 = chosen
+        frac = 0.0 if m1 <= m0 + 1e-9 else float(np.clip((m - m0) / (m1 - m0), 0.0, 1.0))
+        out[k] = t0 + frac * (t1 - t0)
+    return out
+
+
+def _home_daily_resampled_polylines_graph(
+    rec: dict[str, Any],
+) -> list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] | None:
+    """
+    Per-day graph polylines resampled at the same walk speed / dt as the full-walk green layer.
+    """
+    meta = rec.get("osm_home_daily_meta")
+    if not isinstance(meta, dict):
+        return None
+    polys = meta.get("day_polylines_graph_m")
+    if not isinstance(polys, list) or len(polys) < 1:
+        return None
+
+    from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph, resample_polyline_at_speed
+
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    out: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
+    for d, apoly in enumerate(polys):
+        arr = np.asarray(apoly, dtype=np.float64)
+        if arr.shape[0] < 2:
+            continue
+        seg = np.diff(arr, axis=0)
+        plen = float(np.sum(np.hypot(seg[:, 0], seg[:, 1])))
+        step_m = max(float(cfg.walk_speed_m_s) * float(cfg.dt_s), 1e-9)
+        n_out = max(1, int(math.ceil(plen / step_m)))
+        x_d, y_d, h_d = resample_polyline_at_speed(
+            arr,
+            speed_m_s=float(cfg.walk_speed_m_s),
+            dt_s=float(cfg.dt_s),
+            n_out=n_out,
+            repeat_path=False,
+        )
+        out.append((d, x_d, y_d, h_d))
+    return out if out else None
+
+
+def _policy_on_day_segments_from_playback(
+    rec: dict[str, Any],
+    *,
+    day_index: int,
+    nseg_day: int,
+) -> np.ndarray | None:
+    """
+    Boolean mask over a single day's resampled route segments that were scanned by the policy.
+
+    This uses the same episode-step wall-clock overlap with travel phases as the map-age raster,
+    but converts overlap into local moving time within the day route.
+    """
+    if nseg_day < 1:
+        return None
+    pb = rec.get("playback")
+    if not isinstance(pb, dict):
+        return None
+    evs = pb.get("events")
+    if not isinstance(evs, list) or len(evs) < 1:
+        return None
+    sim_arr = np.asarray(rec.get("sim_time_s"), dtype=np.float64).ravel()
+    on_ep = np.asarray(rec.get("camera_on_effective"), dtype=np.float64).ravel()
+    if sim_arr.size < 1 or on_ep.size < 1:
+        return None
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    dt_s = float(cfg.dt_s)
+    n_ep = min(sim_arr.size, on_ep.size)
+
+    day_travel: list[dict[str, float]] = []
+    day_m0 = float("inf")
+    for ev in evs:
+        if str(ev.get("phase")) != "travel":
+            continue
+        if int(ev.get("day_index", -1)) != int(day_index):
+            continue
+        t0 = float(ev.get("t_start_s", 0.0))
+        t1 = float(ev.get("t_end_s", t0))
+        if t1 < t0:
+            t0, t1 = t1, t0
+        m0 = float(ev.get("t_moving_cumulative_at_start_s", 0.0))
+        m1 = float(ev.get("t_moving_cumulative_at_end_s", m0))
+        if m1 < m0:
+            m0, m1 = m1, m0
+        day_m0 = min(day_m0, m0)
+        day_travel.append({"t0": t0, "t1": t1, "m0": m0, "m1": m1})
+    if not day_travel:
+        return None
+
+    out = np.zeros(nseg_day, dtype=bool)
+    for k in range(n_ep):
+        if not bool(on_ep[k] > 0.5):
+            continue
+        w1 = float(sim_arr[k])
+        w0 = w1 - dt_s
+        for ev in day_travel:
+            t0 = float(ev["t0"])
+            t1 = float(ev["t1"])
+            ov0 = max(w0, t0)
+            ov1 = min(w1, t1)
+            if ov1 <= ov0 + 1e-9:
+                continue
+            dur = max(t1 - t0, 1e-9)
+            frac0 = (ov0 - t0) / dur
+            frac1 = (ov1 - t0) / dur
+            m0 = float(ev["m0"]) + frac0 * (float(ev["m1"]) - float(ev["m0"])) - day_m0
+            m1 = float(ev["m0"]) + frac1 * (float(ev["m1"]) - float(ev["m0"])) - day_m0
+            i0 = max(0, int(math.floor((m0 + 1e-9) / dt_s)))
+            i1 = min(nseg_day - 1, int(math.ceil((m1 - 1e-9) / dt_s)) - 1)
+            if i1 >= i0:
+                out[i0 : i1 + 1] = True
+    return out
+
+
+def _segment_stamp_times_for_day_from_playback(
+    rec: dict[str, Any],
+    *,
+    day_index: int,
+    nseg_day: int,
+) -> np.ndarray | None:
+    """Absolute episode-time stamps for one day's local moving-route segment starts."""
+    if nseg_day < 1:
+        return None
+    pb = rec.get("playback")
+    if not isinstance(pb, dict):
+        return None
+    evs = pb.get("events")
+    if not isinstance(evs, list) or len(evs) < 1:
+        return None
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    dt_s = float(cfg.dt_s)
+
+    day_travel: list[tuple[float, float, float, float]] = []
+    day_m0 = float("inf")
+    for ev in evs:
+        if str(ev.get("phase")) != "travel":
+            continue
+        if int(ev.get("day_index", -1)) != int(day_index):
+            continue
+        t0 = float(ev.get("t_start_s", 0.0))
+        t1 = float(ev.get("t_end_s", t0))
+        if t1 < t0:
+            t0, t1 = t1, t0
+        m0 = float(ev.get("t_moving_cumulative_at_start_s", 0.0))
+        m1 = float(ev.get("t_moving_cumulative_at_end_s", m0))
+        if m1 < m0:
+            m0, m1 = m1, m0
+        day_m0 = min(day_m0, m0)
+        day_travel.append((m0, m1, t0, t1))
+    if not day_travel:
+        return None
+
+    out = np.empty(nseg_day, dtype=np.float64)
+    for k in range(nseg_day):
+        m_local = float(k) * dt_s
+        m_abs = day_m0 + m_local
+        chosen = None
+        for m0, m1, t0, t1 in day_travel:
+            if m0 - 1e-6 <= m_abs <= m1 + 1e-6:
+                chosen = (m0, m1, t0, t1)
+        if chosen is None:
+            best = min(day_travel, key=lambda row: abs(m_abs - 0.5 * (row[0] + row[1])))
+            m0, m1, t0, t1 = best
+        else:
+            m0, m1, t0, t1 = chosen
+        frac = 0.0 if m1 <= m0 + 1e-9 else float(np.clip((m_abs - m0) / (m1 - m0), 0.0, 1.0))
+        out[k] = t0 + frac * (t1 - t0)
+    return out
+
+
+def _stationary_policy_scan_points_from_playback(
+    rec: dict[str, Any],
+) -> list[tuple[int, float, float, float, float]]:
+    """
+    Policy scan wedges that occurred during non-travel playback phases.
+
+    Returns rows ``(day_index, x_graph_m, y_graph_m, heading_rad, stamp_start_s)``.
+    These are the scans that appear in the env-step CSV but are invisible if we only
+    project policy scans onto moving route segments.
+    """
+    pb = rec.get("playback")
+    if not isinstance(pb, dict):
+        return []
+    evs = pb.get("events")
+    if not isinstance(evs, list) or len(evs) < 1:
+        return []
+
+    sim_arr = np.asarray(rec.get("sim_time_s"), dtype=np.float64).ravel()
+    on_ep = np.asarray(rec.get("camera_on_effective"), dtype=np.float64).ravel()
+    if sim_arr.size < 1 or on_ep.size < 1:
+        return []
+
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    dt_s = float(cfg.dt_s)
+    n_ep = min(sim_arr.size, on_ep.size)
+
+    stationary_events: list[dict[str, float]] = []
+    for ev in evs:
+        phase = str(ev.get("phase", ""))
+        if phase == "travel":
+            continue
+        try:
+            stationary_events.append(
+                {
+                    "t0": float(ev.get("t_start_s", 0.0)),
+                    "t1": float(ev.get("t_end_s", 0.0)),
+                    "day": float(ev.get("day_index", -1)),
+                    "x": float(ev.get("x_m", 0.0)),
+                    "y": float(ev.get("y_m", 0.0)),
+                    "h": float(ev.get("heading_rad", 0.0)),
+                }
+            )
+        except Exception:
+            continue
+    if not stationary_events:
+        return []
+
+    out: list[tuple[int, float, float, float, float]] = []
+    for k in range(n_ep):
+        if not bool(on_ep[k] > 0.5):
+            continue
+        w1 = float(sim_arr[k])
+        w0 = w1 - dt_s
+        best: dict[str, float] | None = None
+        best_ov = 0.0
+        for ev in stationary_events:
+            t0 = float(ev["t0"])
+            t1 = float(ev["t1"])
+            if t1 < t0:
+                t0, t1 = t1, t0
+            ov = min(w1, t1) - max(w0, t0)
+            if ov > best_ov + 1e-9:
+                best_ov = ov
+                best = ev
+        if best is None or best_ov <= 1e-9:
+            continue
+        day = int(best["day"])
+        if day < 0:
+            continue
+        out.append((day, float(best["x"]), float(best["y"]), float(best["h"]), w0))
+    return out
+
+
+def _append_stationary_segments_to_simulation(
+    *,
+    x_path: np.ndarray,
+    y_path: np.ndarray,
+    h_path: np.ndarray,
+    day_seg: np.ndarray,
+    on_mask: np.ndarray,
+    stamps: np.ndarray,
+    stationary_scans: list[tuple[int, float, float, float, float]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Append zero-length scanned wedges to an existing stepped simulation path.
+
+    Each appended stationary scan becomes one OFF connector segment followed by one ON
+    zero-length segment at the stationary location. This lets the unified simulator stamp
+    the wedge without fabricating a moving connector on the map.
+    """
+    xp = np.asarray(x_path, dtype=np.float64).ravel().tolist()
+    yp = np.asarray(y_path, dtype=np.float64).ravel().tolist()
+    hp = np.asarray(h_path, dtype=np.float64).ravel().tolist()
+    day = np.asarray(day_seg, dtype=np.int32).ravel().tolist()
+    on = np.asarray(on_mask, dtype=bool).ravel().tolist()
+    st = np.asarray(stamps, dtype=np.float64).ravel().tolist()
+
+    if not stationary_scans:
+        return (
+            np.asarray(xp, dtype=np.float64),
+            np.asarray(yp, dtype=np.float64),
+            np.asarray(hp, dtype=np.float64),
+            np.asarray(day, dtype=np.int32),
+            np.asarray(on, dtype=bool),
+            np.asarray(st, dtype=np.float64),
+        )
+
+    if not xp:
+        d0, x0, y0, h0, t0 = stationary_scans[0]
+        xp = [x0]
+        yp = [y0]
+        hp = [h0]
+        day = []
+        on = []
+        st = []
+
+    for d, xs, ys, hs, ts in stationary_scans:
+        xp.append(float(xs))
+        yp.append(float(ys))
+        hp.append(float(hs))
+        day.append(int(d))
+        on.append(False)
+        st.append(float(ts))
+
+        xp.append(float(xs))
+        yp.append(float(ys))
+        hp.append(float(hs))
+        day.append(int(d))
+        on.append(True)
+        st.append(float(ts))
+
+    return (
+        np.asarray(xp, dtype=np.float64),
+        np.asarray(yp, dtype=np.float64),
+        np.asarray(hp, dtype=np.float64),
+        np.asarray(day, dtype=np.int32),
+        np.asarray(on, dtype=bool),
+        np.asarray(st, dtype=np.float64),
+    )
+
+
+def home_daily_per_day_coverage_layers_3857(
+    rec: dict[str, Any],
+    *,
+    graph_crs: str,
+    x_graph: np.ndarray,
+    y_graph: np.ndarray,
+    h_graph: np.ndarray,
+    stride: int,
+    cfg: AdaptiveScanningConfig,
+) -> list[tuple[str, str, Any]] | None:
+    """
+    Always-on wedge unions in EPSG:3857, one merged polygon per calendar day.
+
+    These layers follow the actual episode timeline, so callers should pass the graph-space
+    trajectory derived from ``rec["xs"]/rec["ys"]`` rather than the one-pass route resample
+    used for the combined always-on green layer.
+    """
+    import geopandas as gpd
+    from shapely.ops import unary_union
+    day_resampled = _home_daily_resampled_polylines_graph(rec)
+    if day_resampled is not None:
+        r_m = float(cfg.scan_radius_m)
+        st = max(1, int(stride))
+        layers: list[tuple[str, str, Any]] = []
+        for d, xa, ya, ha in day_resampled:
+            n_scan = int(xa.size) - 1
+            wedges: list[Any] = []
+            for i in range(0, n_scan, st):
+                wedges.extend(
+                    _wedge_polygons_motion_segment_utm(
+                        float(xa[i]),
+                        float(ya[i]),
+                        float(ha[i]),
+                        float(xa[i + 1]),
+                        float(ya[i + 1]),
+                        float(ha[i + 1]),
+                        radius_m=r_m,
+                        hfov_deg=float(cfg.hfov_deg),
+                        resolution_m=float(cfg.resolution_m),
+                    )
+                )
+            if not wedges:
+                continue
+            uu = unary_union(wedges)
+            if uu.is_empty:
+                continue
+            g3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+            col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+            layers.append((f"Coverage â€” always-on Day {d + 1}", col, g3857))
+        return layers if layers else None
+    from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph
+
+    xs_a = np.asarray(rec.get("xs"), dtype=np.float64).ravel()
+    ys_a = np.asarray(rec.get("ys"), dtype=np.float64).ravel()
+    if xs_a.size >= 2 and ys_a.size == xs_a.size:
+        n_scan = int(xs_a.size) - 1
+        hs = rec.get("traj_heading_rad")
+        if hs is not None and int(np.asarray(hs).size) == int(xs_a.size):
+            h_pol = np.asarray(hs, dtype=np.float64).ravel()[: int(xs_a.size)]
+        else:
+            h_pol = np.empty(int(xs_a.size), dtype=np.float64)
+            for ii in range(int(xs_a.size) - 1):
+                h_pol[ii] = math.atan2(
+                    float(ys_a[ii + 1] - ys_a[ii]),
+                    float(xs_a[ii + 1] - xs_a[ii]),
+                )
+            h_pol[-1] = h_pol[-2]
+
+        on = np.asarray(rec["camera_on_effective"], dtype=np.float64).ravel()[:n_scan] > 0.5
+        if np.any(on):
+            day_seg = _segment_day_indices_playback(rec, n_scan)
+            if day_seg is None:
+                day_seg = np.zeros(n_scan, dtype=np.int32)
+            poly = rec.get("polyline_graph_m")
+            if poly is not None:
+                poly_a = np.asarray(poly, dtype=np.float64)
+                world_w_m = float(cfg.nx) * float(cfg.resolution_m)
+                world_h_m = float(cfg.ny) * float(cfg.resolution_m)
+                r_m = float(cfg.scan_radius_m)
+                by_day_actual: dict[int, list[Any]] = {}
+                for i in range(n_scan):
+                    if not bool(on[i]):
+                        continue
+                    d = int(day_seg[i])
+                    wseg = np.array(
+                        [[xs_a[i], ys_a[i]], [xs_a[i + 1], ys_a[i + 1]]],
+                        dtype=np.float64,
+                    )
+                    gseg = inverse_affine_world_to_graph(
+                        wseg,
+                        poly_a,
+                        world_w_m=world_w_m,
+                        world_h_m=world_h_m,
+                        margin=1.0,
+                    )
+                    wedges_g = _wedge_polygons_motion_segment_utm(
+                        float(gseg[0, 0]),
+                        float(gseg[0, 1]),
+                        float(h_pol[i]),
+                        float(gseg[1, 0]),
+                        float(gseg[1, 1]),
+                        float(h_pol[i + 1]),
+                        radius_m=r_m,
+                        hfov_deg=float(cfg.hfov_deg),
+                        resolution_m=float(cfg.resolution_m),
+                    )
+                    if wedges_g:
+                        by_day_actual.setdefault(d, []).extend(wedges_g)
+                if by_day_actual:
+                    layers_actual: list[tuple[str, str, Any]] = []
+                    for d in sorted(by_day_actual.keys()):
+                        parts = by_day_actual[d]
+                        if not parts:
+                            continue
+                        uu = unary_union(parts)
+                        if uu.is_empty:
+                            continue
+                        g3857 = gpd.GeoDataFrame(
+                            geometry=[uu], crs=str(graph_crs)
+                        ).to_crs(3857).geometry.iloc[0]
+                        col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+                        layers_actual.append((f"Coverage â€” policy camera Day {d + 1}", col, g3857))
+                    if layers_actual:
+                        return layers_actual
+
+    day_resampled = _home_daily_resampled_polylines_graph(rec)
+    if day_resampled is not None:
+        r_m = float(cfg.scan_radius_m)
+        st = max(1, int(stride))
+        layers: list[tuple[str, str, Any]] = []
+        for d, xa, ya, ha in day_resampled:
+            n_scan = int(xa.size) - 1
+            wedges: list[Any] = []
+            for i in range(0, n_scan, st):
+                wedges.extend(
+                    _wedge_polygons_motion_segment_utm(
+                        float(xa[i]),
+                        float(ya[i]),
+                        float(ha[i]),
+                        float(xa[i + 1]),
+                        float(ya[i + 1]),
+                        float(ha[i + 1]),
+                        radius_m=r_m,
+                        hfov_deg=float(cfg.hfov_deg),
+                        resolution_m=float(cfg.resolution_m),
+                    )
+                )
+            if not wedges:
+                continue
+            uu = unary_union(wedges)
+            if uu.is_empty:
+                continue
+            g3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+            col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+            layers.append((f"Coverage — always-on Day {d + 1}", col, g3857))
+        return layers if layers else None
+
+    xa = np.asarray(x_graph, dtype=np.float64).ravel()
+    ya = np.asarray(y_graph, dtype=np.float64).ravel()
+    ha = np.asarray(h_graph, dtype=np.float64).ravel()
+    if xa.size < 2 or xa.size != ya.size or ha.size != xa.size:
+        return None
+    n_scan = int(xa.size) - 1
+    n_eff = _moving_segment_count_from_playback(rec, n_scan)
+    if n_eff is not None:
+        n_scan = int(n_eff)
+        xa = xa[: n_scan + 1]
+        ya = ya[: n_scan + 1]
+        ha = ha[: n_scan + 1]
+    day_seg = _canonical_day_segment_indices_from_meta(rec, n_scan)
+    if day_seg is None:
+        day_seg = _moving_segment_day_indices_playback(rec, n_scan)
+    if day_seg is None:
+        return None
+    if int(day_seg.max()) == int(day_seg.min()):
+        return None
+
+    st = max(1, int(stride))
+    r_m = float(cfg.scan_radius_m)
+    by_day: dict[int, list[Any]] = {}
+    for i in range(0, n_scan, st):
+        d = int(day_seg[i])
+        w = _wedge_polygons_motion_segment_utm(
+            float(xa[i]),
+            float(ya[i]),
+            float(ha[i]),
+            float(xa[i + 1]),
+            float(ya[i + 1]),
+            float(ha[i + 1]),
+            radius_m=r_m,
+            hfov_deg=float(cfg.hfov_deg),
+            resolution_m=float(cfg.resolution_m),
+        )
+        by_day.setdefault(d, []).extend(w)
+
+    layers: list[tuple[str, str, Any]] = []
+    for d in sorted(by_day.keys()):
+        wedges = by_day[d]
+        if not wedges:
+            continue
+        uu = unary_union(wedges)
+        if uu.is_empty:
+            continue
+        g3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+        col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+        layers.append((f"Coverage — always-on Day {d + 1}", col, g3857))
+    return layers if len(layers) > 1 else None
+
+
+def policy_camera_coverage_layers_3857_by_day(
+    rec: dict[str, Any],
+    *,
+    x_graph: np.ndarray,
+    y_graph: np.ndarray,
+    h_graph: np.ndarray,
+    graph_crs: str,
+    stride: int,
+    cfg: AdaptiveScanningConfig,
+) -> list[tuple[str, str, Any]] | None:
+    """
+    Motion-integrated sector wedges along **``rec["xs"], rec["ys"]``** (env world metres — the same
+    path as map-age stamping), **only for segments where** ``camera_on_effective`` **is true**.
+
+    Uses the same **segment stride** as the merged always-on green layer (``try_save_realworld_*``),
+    so wedge sampling density matches green and unions do not over-thicken from every-``dt`` overlap.
+
+    Wedges are built in **graph projected metres** (after mapping segment endpoints from world) so
+    ``scan_radius_m`` matches always-on / env scale, then EPSG:3857 for Folium.
+    One merged polygon per playback day (or day 0 when playback is absent).
+    """
+    import geopandas as gpd
+    from shapely.ops import unary_union
+    from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph
+
+    xs_a = np.asarray(rec.get("xs"), dtype=np.float64).ravel()
+    ys_a = np.asarray(rec.get("ys"), dtype=np.float64).ravel()
+    if xs_a.size >= 2 and ys_a.size == xs_a.size:
+        n_scan = int(xs_a.size) - 1
+        hs = rec.get("traj_heading_rad")
+        if hs is not None and int(np.asarray(hs).size) == int(xs_a.size):
+            h_pol = np.asarray(hs, dtype=np.float64).ravel()[: int(xs_a.size)]
+        else:
+            h_pol = np.empty(int(xs_a.size), dtype=np.float64)
+            for ii in range(int(xs_a.size) - 1):
+                h_pol[ii] = math.atan2(
+                    float(ys_a[ii + 1] - ys_a[ii]),
+                    float(xs_a[ii + 1] - xs_a[ii]),
+                )
+            h_pol[-1] = h_pol[-2]
+        on = np.asarray(rec["camera_on_effective"], dtype=np.float64).ravel()[:n_scan] > 0.5
+        if np.any(on):
+            day_seg = _segment_day_indices_playback(rec, n_scan)
+            if day_seg is None:
+                day_seg = np.zeros(n_scan, dtype=np.int32)
+            poly = rec.get("polyline_graph_m")
+            if poly is not None:
+                poly_a = np.asarray(poly, dtype=np.float64)
+                world_w_m = float(cfg.nx) * float(cfg.resolution_m)
+                world_h_m = float(cfg.ny) * float(cfg.resolution_m)
+                r_m = float(cfg.scan_radius_m)
+                by_day_actual: dict[int, list[Any]] = {}
+                for i in range(n_scan):
+                    if not bool(on[i]):
+                        continue
+                    d = int(day_seg[i])
+                    wseg = np.array(
+                        [[xs_a[i], ys_a[i]], [xs_a[i + 1], ys_a[i + 1]]],
+                        dtype=np.float64,
+                    )
+                    gseg = inverse_affine_world_to_graph(
+                        wseg,
+                        poly_a,
+                        world_w_m=world_w_m,
+                        world_h_m=world_h_m,
+                        margin=1.0,
+                    )
+                    wedges_g = _wedge_polygons_motion_segment_utm(
+                        float(gseg[0, 0]),
+                        float(gseg[0, 1]),
+                        float(h_pol[i]),
+                        float(gseg[1, 0]),
+                        float(gseg[1, 1]),
+                        float(h_pol[i + 1]),
+                        radius_m=r_m,
+                        hfov_deg=float(cfg.hfov_deg),
+                        resolution_m=float(cfg.resolution_m),
+                    )
+                    if wedges_g:
+                        by_day_actual.setdefault(d, []).extend(wedges_g)
+                if by_day_actual:
+                    layers_actual: list[tuple[str, str, Any]] = []
+                    for d in sorted(by_day_actual.keys()):
+                        parts = by_day_actual[d]
+                        if not parts:
+                            continue
+                        uu = unary_union(parts)
+                        if uu.is_empty:
+                            continue
+                        g3857 = gpd.GeoDataFrame(
+                            geometry=[uu], crs=str(graph_crs)
+                        ).to_crs(3857).geometry.iloc[0]
+                        col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+                        layers_actual.append((f"Coverage â€” policy camera Day {d + 1}", col, g3857))
+                    if layers_actual:
+                        return layers_actual
+
+    day_resampled = _home_daily_resampled_polylines_graph(rec)
+    if day_resampled is not None:
+        r_m = float(cfg.scan_radius_m)
+        st = max(1, int(stride))
+        layers: list[tuple[str, str, Any]] = []
+        for d, xg_d, yg_d, hg_d in day_resampled:
+            n_scan = int(xg_d.size) - 1
+            on_d = _policy_on_day_segments_from_playback(rec, day_index=d, nseg_day=n_scan)
+            if on_d is None or not np.any(on_d):
+                continue
+            wedges: list[Any] = []
+            for i in range(0, n_scan, st):
+                if not bool(on_d[i]):
+                    continue
+                wedges.extend(
+                    _wedge_polygons_motion_segment_utm(
+                        float(xg_d[i]),
+                        float(yg_d[i]),
+                        float(hg_d[i]),
+                        float(xg_d[i + 1]),
+                        float(yg_d[i + 1]),
+                        float(hg_d[i + 1]),
+                        radius_m=r_m,
+                        hfov_deg=float(cfg.hfov_deg),
+                        resolution_m=float(cfg.resolution_m),
+                    )
+                )
+            if not wedges:
+                continue
+            uu = unary_union(wedges)
+            if uu.is_empty:
+                continue
+            g3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+            col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+            layers.append((f"Coverage — policy camera Day {d + 1}", col, g3857))
+        return layers if layers else None
+
+    xg = np.asarray(x_graph, dtype=np.float64).ravel()
+    yg = np.asarray(y_graph, dtype=np.float64).ravel()
+    hg = np.asarray(h_graph, dtype=np.float64).ravel()
+    if xg.size < 2 or yg.size != xg.size or hg.size != xg.size:
+        return None
+    n_scan = int(xg.size) - 1
+    n_eff = _moving_segment_count_from_playback(rec, n_scan)
+    if n_eff is not None:
+        n_scan = int(n_eff)
+        xg = xg[: n_scan + 1]
+        yg = yg[: n_scan + 1]
+        hg = hg[: n_scan + 1]
+    on = _policy_on_moving_segments(rec, n_scan)
+    if on is None:
+        on = np.asarray(rec["camera_on_effective"], dtype=np.float64).ravel()[:n_scan] > 0.5
+    if not np.any(on):
+        return None
+
+    day_seg = _canonical_day_segment_indices_from_meta(rec, n_scan)
+    if day_seg is None:
+        day_seg = _moving_segment_day_indices_playback(rec, n_scan)
+    if day_seg is None:
+        day_seg = np.zeros(n_scan, dtype=np.int32)
+
+    st = max(1, int(stride))
+    r_m = float(cfg.scan_radius_m)
+    by_day: dict[int, list[Any]] = {}
+    for i in range(0, n_scan, st):
+        if not bool(on[i]):
+            continue
+        d = int(day_seg[i])
+        wedges_g = _wedge_polygons_motion_segment_utm(
+            float(xg[i]),
+            float(yg[i]),
+            float(hg[i]),
+            float(xg[i + 1]),
+            float(yg[i + 1]),
+            float(hg[i + 1]),
+            radius_m=r_m,
+            hfov_deg=float(cfg.hfov_deg),
+            resolution_m=float(cfg.resolution_m),
+        )
+        if not wedges_g:
+            continue
+        by_day.setdefault(d, []).extend(wedges_g)
+
+    layers: list[tuple[str, str, Any]] = []
+    for d in sorted(by_day.keys()):
+        parts = by_day[d]
+        if not parts:
+            continue
+        uu = unary_union(parts)
+        if uu.is_empty:
+            continue
+        g3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+        col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+        layers.append((f"Coverage — policy camera Day {d + 1}", col, g3857))
+    return layers if layers else None
+
+
 def _sector_wedge_polygon(
     ax: float,
     ay: float,
@@ -378,6 +1391,333 @@ def _sector_wedge_polygon(
         ring.append((ax + radius_m * math.cos(float(a)), ay + radius_m * math.sin(float(a))))
     ring.append((ax, ay))
     return Polygon(ring)
+
+
+def home_daily_per_day_coverage_layers_3857_v2(
+    rec: dict[str, Any],
+    *,
+    graph_crs: str,
+    x_graph: np.ndarray,
+    y_graph: np.ndarray,
+    h_graph: np.ndarray,
+    stride: int,
+    cfg: AdaptiveScanningConfig,
+) -> list[tuple[str, str, Any]] | None:
+    """Clean replacement for per-day always-on coverage."""
+    import geopandas as gpd
+    from shapely.ops import unary_union
+
+    day_resampled = _home_daily_resampled_polylines_graph(rec)
+    if day_resampled is not None:
+        layers: list[tuple[str, str, Any]] = []
+        for d, xa, ya, ha in day_resampled:
+            n_scan = int(xa.size) - 1
+            wedges: list[Any] = []
+            for i in range(0, n_scan, max(1, int(stride))):
+                wedges.extend(
+                    _wedge_polygons_motion_segment_utm(
+                        float(xa[i]),
+                        float(ya[i]),
+                        float(ha[i]),
+                        float(xa[i + 1]),
+                        float(ya[i + 1]),
+                        float(ha[i + 1]),
+                        radius_m=float(cfg.scan_radius_m),
+                        hfov_deg=float(cfg.hfov_deg),
+                        resolution_m=float(cfg.resolution_m),
+                    )
+                )
+            if not wedges:
+                continue
+            uu = unary_union(wedges)
+            if uu.is_empty:
+                continue
+            geom3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+            col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+            layers.append((f"Coverage — always-on Day {d + 1}", col, geom3857))
+        return layers if layers else None
+
+    xa = np.asarray(x_graph, dtype=np.float64).ravel()
+    ya = np.asarray(y_graph, dtype=np.float64).ravel()
+    ha = np.asarray(h_graph, dtype=np.float64).ravel()
+    if xa.size < 2 or ya.size != xa.size or ha.size != xa.size:
+        return None
+    n_scan = int(xa.size) - 1
+    day_seg = _canonical_day_segment_indices_from_meta(rec, n_scan)
+    if day_seg is None:
+        day_seg = _moving_segment_day_indices_playback(rec, n_scan)
+    if day_seg is None or int(day_seg.max()) == int(day_seg.min()):
+        return None
+
+    by_day: dict[int, list[Any]] = {}
+    for i in range(0, n_scan, max(1, int(stride))):
+        by_day.setdefault(int(day_seg[i]), []).extend(
+            _wedge_polygons_motion_segment_utm(
+                float(xa[i]),
+                float(ya[i]),
+                float(ha[i]),
+                float(xa[i + 1]),
+                float(ya[i + 1]),
+                float(ha[i + 1]),
+                radius_m=float(cfg.scan_radius_m),
+                hfov_deg=float(cfg.hfov_deg),
+                resolution_m=float(cfg.resolution_m),
+            )
+        )
+    layers: list[tuple[str, str, Any]] = []
+    for d in sorted(by_day.keys()):
+        uu = unary_union(by_day[d])
+        if uu.is_empty:
+            continue
+        geom3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+        col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+        layers.append((f"Coverage — always-on Day {d + 1}", col, geom3857))
+    return layers if layers else None
+
+
+def policy_camera_coverage_layers_3857_by_day_v2(
+    rec: dict[str, Any],
+    *,
+    graph_crs: str,
+    cfg: AdaptiveScanningConfig,
+) -> list[tuple[str, str, Any]] | None:
+    """Clean replacement for policy coverage, aligned with map-age env-path stamping."""
+    import geopandas as gpd
+    from shapely.ops import unary_union
+    from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph
+
+    xs_a = np.asarray(rec.get("xs"), dtype=np.float64).ravel()
+    ys_a = np.asarray(rec.get("ys"), dtype=np.float64).ravel()
+    if xs_a.size < 2 or ys_a.size != xs_a.size:
+        return None
+    n_scan = int(xs_a.size) - 1
+    on = np.asarray(rec.get("camera_on_effective"), dtype=np.float64).ravel()[:n_scan] > 0.5
+    if not np.any(on):
+        return None
+
+    hs = rec.get("traj_heading_rad")
+    if hs is not None and int(np.asarray(hs).size) == int(xs_a.size):
+        h_pol = np.asarray(hs, dtype=np.float64).ravel()[: int(xs_a.size)]
+    else:
+        h_pol = np.empty(int(xs_a.size), dtype=np.float64)
+        for ii in range(int(xs_a.size) - 1):
+            h_pol[ii] = math.atan2(
+                float(ys_a[ii + 1] - ys_a[ii]),
+                float(xs_a[ii + 1] - xs_a[ii]),
+            )
+        h_pol[-1] = h_pol[-2]
+
+    day_seg = _segment_day_indices_playback(rec, n_scan)
+    if day_seg is None:
+        day_seg = np.zeros(n_scan, dtype=np.int32)
+    poly = rec.get("polyline_graph_m")
+    if poly is None:
+        return None
+    poly_a = np.asarray(poly, dtype=np.float64)
+    world_w_m = float(cfg.nx) * float(cfg.resolution_m)
+    world_h_m = float(cfg.ny) * float(cfg.resolution_m)
+
+    by_day: dict[int, list[Any]] = {}
+    for i in range(n_scan):
+        if not bool(on[i]):
+            continue
+        wseg = np.array([[xs_a[i], ys_a[i]], [xs_a[i + 1], ys_a[i + 1]]], dtype=np.float64)
+        gseg = inverse_affine_world_to_graph(
+            wseg,
+            poly_a,
+            world_w_m=world_w_m,
+            world_h_m=world_h_m,
+            margin=1.0,
+        )
+        by_day.setdefault(int(day_seg[i]), []).extend(
+            _wedge_polygons_motion_segment_utm(
+                float(gseg[0, 0]),
+                float(gseg[0, 1]),
+                float(h_pol[i]),
+                float(gseg[1, 0]),
+                float(gseg[1, 1]),
+                float(h_pol[i + 1]),
+                radius_m=float(cfg.scan_radius_m),
+                hfov_deg=float(cfg.hfov_deg),
+                resolution_m=float(cfg.resolution_m),
+            )
+        )
+
+    layers: list[tuple[str, str, Any]] = []
+    for d in sorted(by_day.keys()):
+        uu = unary_union(by_day[d])
+        if uu.is_empty:
+            continue
+        geom3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+        col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+        layers.append((f"Coverage — policy camera Day {d + 1}", col, geom3857))
+    return layers if layers else None
+
+
+def policy_camera_coverage_layers_3857_v3(
+    rec: dict[str, Any],
+    *,
+    x_graph: np.ndarray,
+    y_graph: np.ndarray,
+    h_graph: np.ndarray,
+    graph_crs: str,
+    stride: int,
+    cfg: AdaptiveScanningConfig,
+) -> list[tuple[str, str, Any]] | None:
+    """Policy coverage on the canonical graph route, aligned to the displayed walking path."""
+    import geopandas as gpd
+    from shapely.ops import unary_union
+
+    xg = np.asarray(x_graph, dtype=np.float64).ravel()
+    yg = np.asarray(y_graph, dtype=np.float64).ravel()
+    hg = np.asarray(h_graph, dtype=np.float64).ravel()
+    if xg.size < 2 or yg.size != xg.size or hg.size != xg.size:
+        return None
+    n_scan = int(xg.size) - 1
+    on = _policy_on_moving_segments(rec, n_scan)
+    if on is None:
+        on = np.asarray(rec.get("camera_on_effective"), dtype=np.float64).ravel()[:n_scan] > 0.5
+    if not np.any(on):
+        return None
+
+    day_seg = _canonical_day_segment_indices_from_meta(rec, n_scan)
+    if day_seg is None:
+        day_seg = _moving_segment_day_indices_playback(rec, n_scan)
+    if day_seg is None:
+        day_seg = np.zeros(n_scan, dtype=np.int32)
+
+    by_day: dict[int, list[Any]] = {}
+    for i in range(0, n_scan, max(1, int(stride))):
+        if not bool(on[i]):
+            continue
+        by_day.setdefault(int(day_seg[i]), []).extend(
+            _wedge_polygons_motion_segment_utm(
+                float(xg[i]),
+                float(yg[i]),
+                float(hg[i]),
+                float(xg[i + 1]),
+                float(yg[i + 1]),
+                float(hg[i + 1]),
+                radius_m=float(cfg.scan_radius_m),
+                hfov_deg=float(cfg.hfov_deg),
+                resolution_m=float(cfg.resolution_m),
+            )
+        )
+
+    layers: list[tuple[str, str, Any]] = []
+    for d in sorted(by_day.keys()):
+        uu = unary_union(by_day[d])
+        if uu.is_empty:
+            continue
+        geom3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+        col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+        layers.append((f"Coverage — policy camera Day {d + 1}", col, geom3857))
+    return layers if layers else None
+
+
+def policy_camera_coverage_layers_3857_v4(
+    rec: dict[str, Any],
+    *,
+    x_graph: np.ndarray,
+    y_graph: np.ndarray,
+    h_graph: np.ndarray,
+    graph_crs: str,
+    stride: int,
+    cfg: AdaptiveScanningConfig,
+) -> list[tuple[str, str, Any]] | None:
+    """Policy coverage on the same canonical route geometry as the displayed path/always-on layers."""
+    import geopandas as gpd
+    from shapely.ops import unary_union
+
+    day_resampled = _home_daily_resampled_polylines_graph(rec)
+    if day_resampled is not None:
+        layers: list[tuple[str, str, Any]] = []
+        st = max(1, int(stride))
+        for d, xg_d, yg_d, hg_d in day_resampled:
+            n_scan_d = int(xg_d.size) - 1
+            if n_scan_d < 1:
+                continue
+            on_d = _policy_on_day_segments_from_playback(rec, day_index=int(d), nseg_day=n_scan_d)
+            if on_d is None or not np.any(on_d):
+                continue
+            wedges: list[Any] = []
+            for i in range(0, n_scan_d, st):
+                if not bool(on_d[i]):
+                    continue
+                wedges.extend(
+                    _wedge_polygons_motion_segment_utm(
+                        float(xg_d[i]),
+                        float(yg_d[i]),
+                        float(hg_d[i]),
+                        float(xg_d[i + 1]),
+                        float(yg_d[i + 1]),
+                        float(hg_d[i + 1]),
+                        radius_m=float(cfg.scan_radius_m),
+                        hfov_deg=float(cfg.hfov_deg),
+                        resolution_m=float(cfg.resolution_m),
+                    )
+                )
+            if not wedges:
+                continue
+            uu = unary_union(wedges)
+            if uu.is_empty:
+                continue
+            geom3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+            col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+            layers.append((f"Coverage â€” policy camera Day {d + 1}", col, geom3857))
+        return layers if layers else None
+
+    xg = np.asarray(x_graph, dtype=np.float64).ravel()
+    yg = np.asarray(y_graph, dtype=np.float64).ravel()
+    hg = np.asarray(h_graph, dtype=np.float64).ravel()
+    if xg.size < 2 or yg.size != xg.size or hg.size != xg.size:
+        return None
+    n_scan = int(xg.size) - 1
+    n_eff = _moving_segment_count_from_playback(rec, n_scan)
+    if n_eff is not None:
+        n_scan = int(n_eff)
+        xg = xg[: n_scan + 1]
+        yg = yg[: n_scan + 1]
+        hg = hg[: n_scan + 1]
+    on = _policy_on_moving_segments(rec, n_scan)
+    if on is None:
+        on = np.asarray(rec.get("camera_on_effective"), dtype=np.float64).ravel()[:n_scan] > 0.5
+    if not np.any(on):
+        return None
+
+    day_seg = _canonical_day_segment_indices_from_meta(rec, n_scan)
+    if day_seg is None:
+        day_seg = _moving_segment_day_indices_playback(rec, n_scan)
+    if day_seg is None:
+        day_seg = np.zeros(n_scan, dtype=np.int32)
+
+    by_day: dict[int, list[Any]] = {}
+    for i in range(0, n_scan, max(1, int(stride))):
+        if not bool(on[i]):
+            continue
+        by_day.setdefault(int(day_seg[i]), []).extend(
+            _wedge_polygons_motion_segment_utm(
+                float(xg[i]),
+                float(yg[i]),
+                float(hg[i]),
+                float(xg[i + 1]),
+                float(yg[i + 1]),
+                float(hg[i + 1]),
+                radius_m=float(cfg.scan_radius_m),
+                hfov_deg=float(cfg.hfov_deg),
+                resolution_m=float(cfg.resolution_m),
+            )
+        )
+
+    layers: list[tuple[str, str, Any]] = []
+    for d in sorted(by_day.keys()):
+        uu = unary_union(by_day[d])
+        if uu.is_empty:
+            continue
+        geom3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
+        col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+        layers.append((f"Coverage â€” policy camera Day {d + 1}", col, geom3857))
+    return layers if layers else None
 
 
 def _wrap_pi_scalar(a: float) -> float:
@@ -415,85 +1755,188 @@ def _wedge_polygons_motion_segment_utm(
     return out
 
 
-def _policy_camera_coverage_union_3857(
+def _canonical_graph_walk_path(
     rec: dict[str, Any],
-    xs: np.ndarray,
-    ys: np.ndarray,
-    poly: np.ndarray,
+    *,
+    x_utm: np.ndarray,
+    y_utm: np.ndarray,
+    h_utm: np.ndarray,
+    utm_crs: str,
     graph_crs: str,
-    utm_crs: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Canonical walked path in graph CRS metres plus per-segment day index."""
+    import geopandas as gpd
+
+    ref_g = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(
+            np.asarray(x_utm, dtype=np.float64),
+            np.asarray(y_utm, dtype=np.float64),
+        ),
+        crs=utm_crs,
+    ).to_crs(graph_crs)
+    xg = np.asarray(ref_g.geometry.x, dtype=np.float64)
+    yg = np.asarray(ref_g.geometry.y, dtype=np.float64)
+    hg = np.asarray(h_utm, dtype=np.float64).ravel()
+    nseg = max(0, int(xg.size) - 1)
+    day_seg = _canonical_day_segment_indices_from_meta(rec, nseg)
+    if day_seg is None:
+        day_seg = _moving_segment_day_indices_playback(rec, nseg)
+    if day_seg is None:
+        day_seg = np.zeros(nseg, dtype=np.int32)
+    return xg, yg, hg, day_seg
+
+
+def _simulate_sector_walk_projected(
+    *,
+    x_path: np.ndarray,
+    y_path: np.ndarray,
+    h_path: np.ndarray,
+    path_crs: str,
+    day_seg: np.ndarray,
+    on_mask: np.ndarray,
+    stamps: np.ndarray,
     cfg: AdaptiveScanningConfig,
-) -> Any | None:
-    """
-    Union of motion-integrated sector wedges in **UTM**, same recipe as always-on coverage,
-    but only for segments where ``camera_on_effective`` is true. Returned in EPSG:3857.
-    """
+    zoom_bounds_3857: tuple[float, float, float, float] | None = None,
+    nx: int = 640,
+    ny: int = 640,
+) -> tuple[Any, dict[int, Any], tuple[np.ndarray, tuple[float, float, float, float], int] | None]:
+    """Single source of truth for coverage polygons and map-age from one stepped wedge simulation."""
     import geopandas as gpd
     from shapely.ops import unary_union
+    from pyproj import Transformer
 
-    from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph
-
-    xs = np.asarray(xs, dtype=np.float64).ravel()
-    ys = np.asarray(ys, dtype=np.float64).ravel()
-    if xs.size < 2 or xs.size != ys.size:
-        return None
-    nseg = int(xs.size) - 1
-    on = np.asarray(rec["camera_on_effective"], dtype=np.float64).ravel()[:nseg] > 0.5
-    if not np.any(on):
-        return None
-
-    world_w_m = float(cfg.nx) * float(cfg.resolution_m)
-    world_h_m = float(cfg.ny) * float(cfg.resolution_m)
-    poly_a = np.asarray(poly, dtype=np.float64)
-    xy_w = np.column_stack([xs, ys])
-    xy_g = inverse_affine_world_to_graph(
-        xy_w,
-        poly_a,
-        world_w_m=world_w_m,
-        world_h_m=world_h_m,
-        margin=1.0,
-    )
-    gdf = gpd.GeoDataFrame(
-        geometry=gpd.points_from_xy(xy_g[:, 0], xy_g[:, 1]),
-        crs=str(graph_crs),
-    ).to_crs(utm_crs)
-    xu = np.asarray(gdf.geometry.x, dtype=np.float64)
-    yu = np.asarray(gdf.geometry.y, dtype=np.float64)
-
-    hs = rec.get("traj_heading_rad")
-    npt = int(xs.size)
-    hu = np.zeros(npt, dtype=np.float64)
-    if hs is not None and int(np.asarray(hs).size) == npt:
-        hu[:] = np.asarray(hs, dtype=np.float64).ravel()[:npt]
-    elif npt >= 2:
-        for ii in range(npt - 1):
-            hu[ii] = math.atan2(float(yu[ii + 1] - yu[ii]), float(xu[ii + 1] - xu[ii]))
-        hu[-1] = hu[-2]
+    xp = np.asarray(x_path, dtype=np.float64).ravel()
+    yp = np.asarray(y_path, dtype=np.float64).ravel()
+    hp = np.asarray(h_path, dtype=np.float64).ravel()
+    nseg = max(0, int(xp.size) - 1)
+    on = np.asarray(on_mask, dtype=bool).ravel()[:nseg]
+    day_arr = np.asarray(day_seg, dtype=np.int32).ravel()[:nseg]
+    st = np.asarray(stamps, dtype=np.float64).ravel()[:nseg]
+    if nseg < 1 or yp.size != xp.size or hp.size != xp.size or on.size < nseg or day_arr.size < nseg or st.size < nseg:
+        return unary_union([]), {}, None
 
     r_m = float(cfg.scan_radius_m)
-    wedges: list[Any] = []
+    half = math.radians(0.5 * float(cfg.hfov_deg))
+    res_m = float(cfg.resolution_m)
+    final_t = float(np.max(st) + float(cfg.dt_s)) if st.size else float(cfg.dt_s)
+
+    build_age = zoom_bounds_3857 is not None
+    if build_age:
+        zx0, zy0, zx1, zy1 = zoom_bounds_3857
+        xmin, xmax = (min(zx0, zx1), max(zx0, zx1))
+        ymin, ymax = (min(zy0, zy1), max(zy0, zy1))
+        gx = np.linspace(xmin, xmax, nx, dtype=np.float64)
+        gy = np.linspace(ymin, ymax, ny, dtype=np.float64)
+        Wx, Wy = np.meshgrid(gx, gy)
+        flat_m = np.column_stack([Wx.ravel(), Wy.ravel()])
+        gdfg = gpd.GeoDataFrame(
+            geometry=gpd.points_from_xy(flat_m[:, 0], flat_m[:, 1]),
+            crs=3857,
+        ).to_crs(path_crs)
+        PX = np.asarray(gdfg.geometry.x, dtype=np.float64).reshape(Wx.shape)
+        PY = np.asarray(gdfg.geometry.y, dtype=np.float64).reshape(Wy.shape)
+        last_scan = np.full((ny, nx), -np.inf, dtype=np.float64)
+        merc_pad = max(r_m * 2.5, 85.0)
+    else:
+        xmin = xmax = ymin = ymax = 0.0
+        gx = gy = Wx = Wy = PX = PY = last_scan = merc_pad = None  # type: ignore[assignment]
+
+    all_parts: list[Any] = []
+    by_day_parts: dict[int, list[Any]] = {}
+    step_m = max(0.5 * res_m, 0.35)
+
     for k in range(nseg):
         if not bool(on[k]):
             continue
-        wedges.extend(
-            _wedge_polygons_motion_segment_utm(
-                float(xu[k]),
-                float(yu[k]),
-                float(hu[k]),
-                float(xu[k + 1]),
-                float(yu[k + 1]),
-                float(hu[k + 1]),
-                radius_m=r_m,
-                hfov_deg=float(cfg.hfov_deg),
-                resolution_m=float(cfg.resolution_m),
+        d = int(day_arr[k])
+        stamp = float(st[k])
+        x0, y0, h0 = float(xp[k]), float(yp[k]), float(hp[k])
+        x1, y1, h1 = float(xp[k + 1]), float(yp[k + 1]), float(hp[k + 1])
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = math.hypot(dx, dy)
+        ns = 1 if dist < 1e-6 else max(2, min(40, int(math.ceil(dist / step_m)) + 1))
+        dh = _wrap_pi_scalar(h1 - h0)
+
+        if build_age:
+            seg3857 = gpd.GeoDataFrame(
+                geometry=gpd.points_from_xy([x0, x1], [y0, y1]),
+                crs=path_crs,
+            ).to_crs(3857)
+            sx = np.asarray(seg3857.geometry.x, dtype=np.float64)
+            sy = np.asarray(seg3857.geometry.y, dtype=np.float64)
+            j0 = max(0, int(np.searchsorted(gx, float(np.min(sx)) - merc_pad)) - 1)
+            j1 = min(nx - 1, int(np.searchsorted(gx, float(np.max(sx)) + merc_pad)) + 1)
+            i0 = max(0, int(np.searchsorted(gy, float(np.min(sy)) - merc_pad)) - 1)
+            i1 = min(ny - 1, int(np.searchsorted(gy, float(np.max(sy)) + merc_pad)) + 1)
+            sub_px = PX[i0 : i1 + 1, j0 : j1 + 1]
+            sub_py = PY[i0 : i1 + 1, j0 : j1 + 1]
+
+        for j in range(ns):
+            t = j / (ns - 1) if ns > 1 else 0.0
+            ax = x0 + t * dx
+            ay = y0 + t * dy
+            hd = _wrap_pi_scalar(h0 + t * dh)
+            poly = _sector_wedge_polygon(ax, ay, hd, r_m, float(cfg.hfov_deg))
+            all_parts.append(poly)
+            by_day_parts.setdefault(d, []).append(poly)
+
+            if build_age:
+                ddx = sub_px - ax
+                ddy = sub_py - ay
+                distm = np.hypot(ddx, ddy)
+                ang = np.arctan2(ddy, ddx) - hd
+                ang = _wrap_pi(ang)
+                m = (distm <= r_m) & (distm >= 1e-3) & (np.abs(ang) <= half)
+                slc = (slice(i0, i1 + 1), slice(j0, j1 + 1))
+                sub = last_scan[slc]
+                last_scan[slc] = np.where(m, np.maximum(sub, stamp), sub)
+
+    cov_union = unary_union(all_parts) if all_parts else unary_union([])
+    by_day_union = {
+        d: unary_union(parts)
+        for d, parts in by_day_parts.items()
+        if parts
+    }
+
+    age_pack = None
+    if build_age:
+        cov_3857 = gpd.GeoDataFrame(geometry=[cov_union], crs=path_crs).to_crs(3857).geometry.iloc[0]
+        try:
+            from shapely import vectorized
+
+            ins = vectorized.contains(cov_3857, Wx, Wy)
+            if hasattr(vectorized, "touches"):
+                ins = ins | vectorized.touches(cov_3857, Wx, Wy)
+        except Exception:
+            from shapely.geometry import Point
+            from shapely.prepared import prep
+
+            prep_c = prep(cov_3857)
+            ins = np.zeros((ny, nx), dtype=bool)
+            for r in range(ny):
+                for c in range(nx):
+                    ins[r, c] = prep_c.covers(Point(float(Wx[r, c]), float(Wy[r, c])))
+        never_in_cov = ins & (last_scan < -1e90)
+        last_plot = np.full_like(last_scan, np.nan, dtype=np.float64)
+        hit = ins & (last_scan > -1e90)
+        last_plot[hit] = last_scan[hit]
+        last_plot[never_in_cov] = 0.0
+        if np.any(np.isfinite(last_plot)):
+            rgba = _sim_time_grid_to_rgba_turbo(last_plot, vmin=0.0, vmax=max(final_t, 1.0))
+            dx_merc = (xmax - xmin) / max(nx - 1, 1)
+            dy_merc = (ymax - ymin) / max(ny - 1, 1)
+            xmin_e = xmin - 0.5 * dx_merc
+            xmax_e = xmax + 0.5 * dx_merc
+            ymin_e = ymin - 0.5 * dy_merc
+            ymax_e = ymax + 0.5 * dy_merc
+            t4326 = Transformer.from_crs(3857, 4326, always_xy=True)
+            lons, lats = t4326.transform(
+                [xmin_e, xmax_e, xmax_e, xmin_e],
+                [ymin_e, ymin_e, ymax_e, ymax_e],
             )
-        )
-    if not wedges:
-        return None
-    uu = unary_union(wedges)
-    if uu.is_empty:
-        return None
-    return gpd.GeoDataFrame(geometry=[uu], crs=utm_crs).to_crs(3857).geometry.iloc[0]
+            age_pack = (rgba, (min(lons), min(lats), max(lons), max(lats)), int(np.sum(hit)))
+    return cov_union, by_day_union, age_pack
 
 
 def _map_extent_webmerc_from_cfg(
@@ -681,6 +2124,8 @@ def _sector_scan_age_rgba_wgs84(
     graph_crs: str,
     world_w_m: float,
     world_h_m: float,
+    on_override: np.ndarray | None = None,
+    stamps_override: np.ndarray | None = None,
     nx: int = 640,
     ny: int = 640,
     stamp_debug_path: Path | None = None,
@@ -692,6 +2137,9 @@ def _sector_scan_age_rgba_wgs84(
     to world (x,y) via graph CRS so distance/angle tests match the simulator. Using
     Web-Mercator chord headings with Mercator positions skewed sectors and collapsed
     ``last_scan`` to a constant / zeros.
+
+    Folium **policy** coverage uses wedge unions (see ``policy_camera_coverage_layers_3857_by_day``),
+    not this raster.
     """
     import geopandas as gpd
     from pyproj import Transformer
@@ -740,7 +2188,17 @@ def _sector_scan_age_rgba_wgs84(
             )
         return None
 
-    if always_on_reference:
+    if on_override is not None:
+        on = np.asarray(on_override, dtype=bool).ravel()[:nseg]
+        if on.size < nseg:
+            return None
+        if stamps_override is not None:
+            stamps = np.asarray(stamps_override, dtype=np.float64).ravel()[:nseg]
+            if stamps.size < nseg:
+                return None
+        else:
+            stamps = np.arange(nseg, dtype=np.float64) * dt_s
+    elif always_on_reference:
         on = np.ones(nseg, dtype=bool)
         stamps = np.arange(nseg, dtype=np.float64) * dt_s
     else:
@@ -839,8 +2297,8 @@ def _sector_scan_age_rgba_wgs84(
     if stamp_debug_path is not None:
         lines = [
             "NOTE: Green Folium coverage = always-on sector wedges along the resampled route.",
-            "It is NOT gated by policy camera_on. Policy map-age uses camera_on_effective unless",
-            "the HTML builder falls back to always-on when the policy never stamps (n_hit=0).",
+            "Policy camera coverage in HTML = motion-integrated wedges (graph m, endpoints from "
+            "rec xs/ys), camera on only; GeoJSON per playback day.",
             "",
             "status=OK",
             f"mode={'always_on_reference' if always_on_reference else 'policy'}",
@@ -883,15 +2341,156 @@ def _sector_scan_age_rgba_wgs84(
         stamp_debug_path.parent.mkdir(parents=True, exist_ok=True)
         stamp_debug_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    dx_merc = (xmax - xmin) / max(nx - 1, 1)
+    dy_merc = (ymax - ymin) / max(ny - 1, 1)
+    xmin_e = xmin - 0.5 * dx_merc
+    xmax_e = xmax + 0.5 * dx_merc
+    ymin_e = ymin - 0.5 * dy_merc
+    ymax_e = ymax + 0.5 * dy_merc
+
     t4326 = Transformer.from_crs(3857, 4326, always_xy=True)
     lons, lats = t4326.transform(
-        [xmin, xmax, xmax, xmin],
-        [ymin, ymin, ymax, ymax],
+        [xmin_e, xmax_e, xmax_e, xmin_e],
+        [ymin_e, ymin_e, ymax_e, ymax_e],
     )
     w, e = min(lons), max(lons)
     s, nlat = min(lats), max(lats)
     n_hit = int(np.sum(hit))
     return rgba, (w, s, e, nlat), n_hit
+
+
+def _sector_scan_age_rgba_projected_wgs84(
+    rec: dict[str, Any],
+    cov_geom_3857: Any,
+    zoom_bounds_3857: tuple[float, float, float, float],
+    *,
+    x_path: np.ndarray,
+    y_path: np.ndarray,
+    h_path: np.ndarray,
+    path_crs: str,
+    on_mask: np.ndarray,
+    stamps: np.ndarray,
+    nx: int = 640,
+    ny: int = 640,
+) -> tuple[np.ndarray, tuple[float, float, float, float], int] | None:
+    """Projected-CRS sector stamping that matches the vector wedge geometry exactly."""
+    import geopandas as gpd
+
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    final_t = float(rec.get("final_sim_time_s", 0.0))
+    r_m = float(cfg.scan_radius_m)
+    half = math.radians(0.5 * float(cfg.hfov_deg))
+    res_m = float(cfg.resolution_m)
+
+    xp = np.asarray(x_path, dtype=np.float64).ravel()
+    yp = np.asarray(y_path, dtype=np.float64).ravel()
+    hp = np.asarray(h_path, dtype=np.float64).ravel()
+    if xp.size < 2 or yp.size != xp.size or hp.size != xp.size:
+        return None
+    nseg = int(xp.size) - 1
+    on = np.asarray(on_mask, dtype=bool).ravel()[:nseg]
+    st = np.asarray(stamps, dtype=np.float64).ravel()[:nseg]
+    if on.size < nseg or st.size < nseg:
+        return None
+
+    zx0, zy0, zx1, zy1 = zoom_bounds_3857
+    xmin, xmax = (min(zx0, zx1), max(zx0, zx1))
+    ymin, ymax = (min(zy0, zy1), max(zy0, zy1))
+    gx = np.linspace(xmin, xmax, nx, dtype=np.float64)
+    gy = np.linspace(ymin, ymax, ny, dtype=np.float64)
+    Wx, Wy = np.meshgrid(gx, gy)
+    flat_m = np.column_stack([Wx.ravel(), Wy.ravel()])
+    gdfg = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(flat_m[:, 0], flat_m[:, 1]),
+        crs=3857,
+    ).to_crs(path_crs)
+    PX = np.asarray(gdfg.geometry.x, dtype=np.float64).reshape(Wx.shape)
+    PY = np.asarray(gdfg.geometry.y, dtype=np.float64).reshape(Wy.shape)
+    last_scan = np.full((ny, nx), -np.inf, dtype=np.float64)
+
+    merc_pad = max(r_m * 2.5, 85.0)
+    step_m = max(0.5 * res_m, 0.35)
+    for k in range(nseg):
+        if not bool(on[k]):
+            continue
+        stamp = float(st[k])
+        x0, y0, h0 = float(xp[k]), float(yp[k]), float(hp[k])
+        x1, y1, h1 = float(xp[k + 1]), float(yp[k + 1]), float(hp[k + 1])
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = math.hypot(dx, dy)
+        ns = 1 if dist < 1e-6 else max(2, min(40, int(math.ceil(dist / step_m)) + 1))
+        dh = _wrap_pi_scalar(h1 - h0)
+
+        seg3857 = gpd.GeoDataFrame(
+            geometry=gpd.points_from_xy([x0, x1], [y0, y1]),
+            crs=path_crs,
+        ).to_crs(3857)
+        sx = np.asarray(seg3857.geometry.x, dtype=np.float64)
+        sy = np.asarray(seg3857.geometry.y, dtype=np.float64)
+        j0 = max(0, int(np.searchsorted(gx, float(np.min(sx)) - merc_pad)) - 1)
+        j1 = min(nx - 1, int(np.searchsorted(gx, float(np.max(sx)) + merc_pad)) + 1)
+        i0 = max(0, int(np.searchsorted(gy, float(np.min(sy)) - merc_pad)) - 1)
+        i1 = min(ny - 1, int(np.searchsorted(gy, float(np.max(sy)) + merc_pad)) + 1)
+        sub_px = PX[i0 : i1 + 1, j0 : j1 + 1]
+        sub_py = PY[i0 : i1 + 1, j0 : j1 + 1]
+
+        for j in range(ns):
+            t = j / (ns - 1) if ns > 1 else 0.0
+            px = x0 + t * dx
+            py = y0 + t * dy
+            ph = _wrap_pi_scalar(h0 + t * dh)
+            ddx = sub_px - px
+            ddy = sub_py - py
+            distm = np.hypot(ddx, ddy)
+            ang = np.arctan2(ddy, ddx) - ph
+            ang = _wrap_pi(ang)
+            m = (distm <= r_m) & (distm >= 1e-3) & (np.abs(ang) <= half)
+            slc = (slice(i0, i1 + 1), slice(j0, j1 + 1))
+            sub = last_scan[slc]
+            last_scan[slc] = np.where(m, np.maximum(sub, stamp), sub)
+
+    geom_cov = cov_geom_3857
+    try:
+        from shapely import vectorized
+
+        ins = vectorized.contains(geom_cov, Wx, Wy)
+        if hasattr(vectorized, "touches"):
+            ins = ins | vectorized.touches(geom_cov, Wx, Wy)
+    except Exception:
+        from shapely.geometry import Point
+        from shapely.prepared import prep
+
+        prep_c = prep(geom_cov)
+        ins = np.zeros((ny, nx), dtype=bool)
+        for r in range(ny):
+            for c in range(nx):
+                ins[r, c] = prep_c.covers(Point(float(Wx[r, c]), float(Wy[r, c])))
+
+    never_in_cov = ins & (last_scan < -1e90)
+    last_plot = np.full_like(last_scan, np.nan, dtype=np.float64)
+    hit = ins & (last_scan > -1e90)
+    last_plot[hit] = last_scan[hit]
+    last_plot[never_in_cov] = 0.0
+    if not np.any(np.isfinite(last_plot)):
+        return None
+
+    rgba = _sim_time_grid_to_rgba_turbo(last_plot, vmin=0.0, vmax=max(final_t, 1.0))
+    dx_merc = (xmax - xmin) / max(nx - 1, 1)
+    dy_merc = (ymax - ymin) / max(ny - 1, 1)
+    xmin_e = xmin - 0.5 * dx_merc
+    xmax_e = xmax + 0.5 * dx_merc
+    ymin_e = ymin - 0.5 * dy_merc
+    ymax_e = ymax + 0.5 * dy_merc
+
+    t4326 = Transformer.from_crs(3857, 4326, always_xy=True)
+    lons, lats = t4326.transform(
+        [xmin_e, xmax_e, xmax_e, xmin_e],
+        [ymin_e, ymin_e, ymax_e, ymax_e],
+    )
+    w, e = min(lons), max(lons)
+    s, nlat = min(lats), max(lats)
+    return rgba, (w, s, e, nlat), int(np.sum(hit))
 
 
 def _save_coverage_mpl_png(
@@ -968,13 +2567,16 @@ def try_save_realworld_always_on_coverage(
       1) ``*_coverage_realworld.png`` — full place/bbox extent, sharp OSM tiles
       2) ``*_coverage_realworld_zoom.png`` — cropped around the route
       3) ``*_coverage_realworld_map.html`` — Folium (if ``folium`` installed): path,
-         **always-on** coverage (green), **policy** coverage when camera on (blue), optional
-         **map-age raster** (``turbo``).
+         **always-on** coverage (green), **per-day** always-on wedges when multi-day playback,
+         **per-day policy** wedge unions when the camera is on (world path + same stride/radius as green),
+         optional **map-age** raster (``turbo``).
 
-    **Coverage vs map age:** the green union is **always-on** wedges along the resampled route
-    (``repeat_path=False``); it does **not** read ``camera_on_effective``. The heatmap uses the
-    policy’s camera first; if the policy never turns the camera on (``n_hit==0``), the HTML
-    layer falls back to the same **always-on** stamping as the coverage footprint.
+    **Coverage vs map age:** the green GeoJSON is motion-integrated **UTM** wedges along the
+    resampled OSM polyline (with ``stride`` when ``n_scan`` is large). **Policy** GeoJSON samples
+    ``rec["xs"], rec["ys"]`` (same as map-age), maps segment endpoints to **graph metres**, builds
+    wedges there with the same ``stride``, ``scan_radius_m``, and ``hfov_deg`` as green (so radius is
+    not inflated by world↔graph scale). Wedges only when ``camera_on_effective`` at sampled indices.
+    Map age is the **grid** ``last_scan`` heatmap from that same world path.
 
     Returns ``(full_png, zoom_png, html_or_none)`` or ``None`` if prerequisites missing.
     """
@@ -992,7 +2594,10 @@ def try_save_realworld_always_on_coverage(
     except ImportError:
         return None
 
-    from adaptive_scanning.street_trajectories import resample_polyline_at_speed
+    from adaptive_scanning.street_trajectories import (
+        inverse_affine_world_to_graph,
+        resample_polyline_at_speed,
+    )
 
     cfg: AdaptiveScanningConfig = rec["cfg"]
     base_image_path = Path(base_image_path)
@@ -1028,29 +2633,160 @@ def try_save_realworld_always_on_coverage(
     )
 
     r_m = float(cfg.scan_radius_m)
-    n_scan = len(x) - 1
-    max_wedges = 9000
-    stride = max(1, int(math.ceil(n_scan / max_wedges)))
+    day_resampled = _home_daily_resampled_polylines_graph(rec)
+    if day_resampled is not None:
+        x_parts: list[np.ndarray] = []
+        y_parts: list[np.ndarray] = []
+        h_parts: list[np.ndarray] = []
+        day_parts: list[np.ndarray] = []
+        on_all_parts: list[np.ndarray] = []
+        on_policy_parts: list[np.ndarray] = []
+        stamp_parts: list[np.ndarray] = []
+        for d, x_d, y_d, h_d in day_resampled:
+            x_d = np.asarray(x_d, dtype=np.float64).ravel()
+            y_d = np.asarray(y_d, dtype=np.float64).ravel()
+            h_d = np.asarray(h_d, dtype=np.float64).ravel()
+            if x_d.size < 2 or y_d.size != x_d.size or h_d.size != x_d.size:
+                continue
+            nseg_d = int(x_d.size) - 1
+            on_d = _policy_on_day_segments_from_playback(rec, day_index=int(d), nseg_day=nseg_d)
+            if on_d is None:
+                on_d = np.zeros(nseg_d, dtype=bool)
+            stamps_d = _segment_stamp_times_for_day_from_playback(rec, day_index=int(d), nseg_day=nseg_d)
+            if stamps_d is None:
+                stamps_d = np.arange(nseg_d, dtype=np.float64) * float(cfg.dt_s)
+            if x_parts:
+                x_parts.append(x_d[1:])
+                y_parts.append(y_d[1:])
+                h_parts.append(h_d[1:])
+            else:
+                x_parts.append(x_d)
+                y_parts.append(y_d)
+                h_parts.append(h_d)
+            day_parts.append(np.full(nseg_d, int(d), dtype=np.int32))
+            on_all_parts.append(np.ones(nseg_d, dtype=bool))
+            on_policy_parts.append(np.asarray(on_d, dtype=bool))
+            stamp_parts.append(np.asarray(stamps_d, dtype=np.float64))
+        if not x_parts or not day_parts:
+            return None
+        xg_walk = np.concatenate(x_parts)
+        yg_walk = np.concatenate(y_parts)
+        hg_walk = np.concatenate(h_parts)
+        day_seg_walk = np.concatenate(day_parts)
+        on_all = np.concatenate(on_all_parts)
+        on_policy = np.concatenate(on_policy_parts)
+        stamps_all = np.concatenate(stamp_parts)
+        stamps_policy = stamps_all.copy()
+        n_scan = int(day_seg_walk.size)
+    else:
+        walk_graph_gdf = gpd.GeoDataFrame(
+            geometry=gpd.points_from_xy(
+                np.asarray(x, dtype=np.float64),
+                np.asarray(y, dtype=np.float64),
+            ),
+            crs=str(utm_crs),
+        ).to_crs(str(crs))
+        xg_walk = np.asarray(walk_graph_gdf.geometry.x, dtype=np.float64)
+        yg_walk = np.asarray(walk_graph_gdf.geometry.y, dtype=np.float64)
+        hg_walk = np.empty(int(xg_walk.size), dtype=np.float64)
+        if xg_walk.size >= 2:
+            for ii in range(int(xg_walk.size) - 1):
+                hg_walk[ii] = math.atan2(
+                    float(yg_walk[ii + 1] - yg_walk[ii]),
+                    float(xg_walk[ii + 1] - xg_walk[ii]),
+                )
+            hg_walk[-1] = hg_walk[-2]
+        else:
+            hg_walk[:] = 0.0
+        n_scan = max(0, int(xg_walk.shape[0]) - 1)
+        day_seg_walk = _canonical_day_segment_indices_from_meta(rec, n_scan)
+        if day_seg_walk is None:
+            day_seg_walk = _moving_segment_day_indices_playback(rec, n_scan)
+        if day_seg_walk is None:
+            day_seg_walk = np.zeros(n_scan, dtype=np.int32)
+        n_move = _moving_segment_count_from_playback(rec, n_scan)
+        on_all = np.ones(n_scan, dtype=bool)
+        if n_move is not None and 0 <= int(n_move) < n_scan:
+            on_all[:] = False
+            on_all[: int(n_move)] = True
+        dt_s = float(cfg.dt_s)
+        stamps_all = _moving_segment_stamp_times_playback(rec, n_scan)
+        if stamps_all is None:
+            stamps_all = np.arange(n_scan, dtype=np.float64) * dt_s
+        on_policy = _policy_on_moving_segments(rec, n_scan)
+        if on_policy is None:
+            on_policy = np.asarray(rec.get("camera_on_effective"), dtype=np.float64).ravel()[:n_scan] > 0.5
+        stamps_policy = stamps_all.copy()
 
-    wedges: list = []
-    for i in range(0, n_scan, stride):
-        wedges.extend(
-            _wedge_polygons_motion_segment_utm(
-                float(x[i]),
-                float(y[i]),
-                float(h[i]),
-                float(x[i + 1]),
-                float(y[i + 1]),
-                float(h[i + 1]),
-                radius_m=r_m,
-                hfov_deg=float(cfg.hfov_deg),
-                resolution_m=float(cfg.resolution_m),
-            )
-        )
-    coverage_utm = unary_union(wedges)
-    cov_gdf = gpd.GeoDataFrame(geometry=[coverage_utm], crs=utm_crs).to_crs(3857)
+    coverage_graph, cov_by_day_graph, _age_unused = _simulate_sector_walk_projected(
+        x_path=xg_walk,
+        y_path=yg_walk,
+        h_path=hg_walk,
+        path_crs=str(crs),
+        day_seg=day_seg_walk,
+        on_mask=on_all,
+        stamps=stamps_all,
+        cfg=cfg,
+    )
+    cov_gdf = gpd.GeoDataFrame(geometry=[coverage_graph], crs=str(crs)).to_crs(3857)
     cov_geom = cov_gdf.geometry.iloc[0]
     path_geom = gwm.geometry.iloc[0]
+
+    stationary_policy_scans = _stationary_policy_scan_points_from_playback(rec)
+    (
+        xg_policy,
+        yg_policy,
+        hg_policy,
+        day_seg_policy,
+        on_policy_aug,
+        stamps_policy_aug,
+    ) = _append_stationary_segments_to_simulation(
+        x_path=xg_walk,
+        y_path=yg_walk,
+        h_path=hg_walk,
+        day_seg=day_seg_walk,
+        on_mask=on_policy,
+        stamps=stamps_policy,
+        stationary_scans=stationary_policy_scans,
+    )
+
+    debug_steps_csv = base_image_path.with_name(f"{base_image_path.stem}_policy_scan_debug_steps.csv")
+    debug_segments_csv = base_image_path.with_name(f"{base_image_path.stem}_policy_scan_debug_segments.csv")
+    act_req = np.asarray(rec.get("action_requested"), dtype=np.int32).ravel()
+    act_eff = np.asarray(rec.get("camera_on_effective"), dtype=np.float64).ravel()
+    budget_arr = np.asarray(rec.get("budget_s"), dtype=np.float64).ravel()
+    sim_arr = np.asarray(rec.get("sim_time_s"), dtype=np.float64).ravel()
+    step_day_idx = _segment_day_indices_playback(rec, int(sim_arr.size))
+    if step_day_idx is None:
+        step_day_idx = np.full(int(sim_arr.size), -1, dtype=np.int32)
+    lines_steps = [
+        "env_step_idx,day_index,step_start_s,sim_time_end_s,action_requested,camera_on_effective,budget_s_after_step"
+    ]
+    for k in range(int(sim_arr.size)):
+        day_k = int(step_day_idx[k]) if k < step_day_idx.size else -1
+        step_start_k = float(sim_arr[k] - float(cfg.dt_s))
+        sim_end_k = float(sim_arr[k])
+        act_req_k = int(act_req[k]) if k < act_req.size else -1
+        act_eff_k = int(act_eff[k] > 0.5) if k < act_eff.size else 0
+        bud_k = float(budget_arr[k]) if k < budget_arr.size else float("nan")
+        lines_steps.append(
+            f"{k},{day_k},{step_start_k:.6f},{sim_end_k:.6f},{act_req_k},{act_eff_k},{bud_k:.6f}"
+        )
+    debug_steps_csv.write_text("\n".join(lines_steps) + "\n", encoding="utf-8")
+
+    lines_segments = [
+        "seg_idx,day_index,stamp_start_s,policy_on_mask,always_on_mask"
+    ]
+    n_policy_seg = max(0, int(day_seg_policy.size))
+    for k in range(n_policy_seg):
+        day_k = int(day_seg_policy[k]) if k < day_seg_policy.size else -1
+        stamp_k = float(stamps_policy_aug[k]) if k < stamps_policy_aug.size else float(k) * float(cfg.dt_s)
+        pol_on_k = int(on_policy_aug[k]) if k < on_policy_aug.size else 0
+        all_on_k = int(on_all[k]) if k < on_all.size else 0
+        lines_segments.append(
+            f"{k},{day_k},{stamp_k:.6f},{pol_on_k},{all_on_k}"
+        )
+    debug_segments_csv.write_text("\n".join(lines_segments) + "\n", encoding="utf-8")
 
     mx0, my0, mx1, my1 = _map_extent_webmerc_from_cfg(cfg, gwm.geometry.iloc[0])
     zx0, zy0, zx1, zy1 = _route_zoom_bounds_3857(gwm, r_m)
@@ -1058,11 +2794,10 @@ def try_save_realworld_always_on_coverage(
     z_full = _tile_zoom_for_bounds_3857(mx0, my0, mx1, my1, max_tiles=280)
     z_crop = _tile_zoom_for_bounds_3857(zx0, zy0, zx1, zy1, max_tiles=56)
 
-    stride_note = f", segment stride={stride}" if stride > 1 else ""
     base_title = (
         f"Always-on (motion-integrated wedges / {cfg.dt_s:.0f}s step): "
         f"{cfg.hfov_deg:.0f}° × {cfg.scan_radius_m:.0f} m, EPSG:3857 — "
-        f"{n_scan} steps{stride_note}  |  {rec.get('trajectory_source', '')}"
+        f"{n_scan} steps  |  {rec.get('trajectory_source', '')}"
     )
 
     _save_coverage_mpl_png(
@@ -1098,91 +2833,32 @@ def try_save_realworld_always_on_coverage(
     try:
         from adaptive_scanning.interactive_map import save_realworld_folium_html
 
-        stamp_txt = out_html.parent / f"{out_html.stem}_stamps.txt"
-
-        world_w_m = float(cfg.nx) * float(cfg.resolution_m)
-        world_h_m = float(cfg.ny) * float(cfg.resolution_m)
-        xs_a = np.asarray(xs, dtype=np.float64)
-        ys_a = np.asarray(rec["ys"], dtype=np.float64)
-        n_path = int(xs_a.shape[0])
-        hs = rec.get("traj_heading_rad")
-        if hs is not None and int(np.asarray(hs).size) == n_path:
-            h_pol = np.asarray(hs, dtype=np.float64).ravel()[:n_path]
-        elif n_path >= 2:
-            h_pol = np.empty(n_path, dtype=np.float64)
-            for ii in range(n_path - 1):
-                h_pol[ii] = math.atan2(
-                    float(ys_a[ii + 1] - ys_a[ii]),
-                    float(xs_a[ii + 1] - xs_a[ii]),
-                )
-            h_pol[-1] = h_pol[-2]
-        else:
-            h_pol = np.zeros(max(1, n_path), dtype=np.float64)
-
-        def _reference_sector_age_pack():
-            ref_g = gpd.GeoDataFrame(
-                geometry=gpd.points_from_xy(
-                    np.asarray(x, dtype=np.float64),
-                    np.asarray(y, dtype=np.float64),
-                ),
-                crs=utm_crs,
-            ).to_crs(str(crs))
-            xg = np.asarray(ref_g.geometry.x, dtype=np.float64)
-            yg = np.asarray(ref_g.geometry.y, dtype=np.float64)
-            xyw_ref = _graph_xy_to_world_xy(
-                np.asarray(poly, dtype=np.float64),
-                np.column_stack([xg, yg]),
-                world_w_m=world_w_m,
-                world_h_m=world_h_m,
-                margin=1.0,
-            )
-            xw_ref = xyw_ref[:, 0]
-            yw_ref = xyw_ref[:, 1]
-            n_ref = int(xw_ref.shape[0])
-            if n_ref >= 2:
-                h_ref = np.empty(n_ref, dtype=np.float64)
-                for ii in range(n_ref - 1):
-                    h_ref[ii] = math.atan2(
-                        float(yg[ii + 1] - yg[ii]),
-                        float(xg[ii + 1] - xg[ii]),
-                    )
-                h_ref[-1] = h_ref[-2]
-            else:
-                h_ref = np.zeros(max(1, n_ref), dtype=np.float64)
-            return _sector_scan_age_rgba_wgs84(
-                rec,
-                cov_geom,
-                (zx0, zy0, zx1, zy1),
-                always_on_reference=True,
-                xw_path=xw_ref,
-                yw_path=yw_ref,
-                h_path=h_ref,
-                poly=np.asarray(poly, dtype=np.float64),
-                graph_crs=str(crs),
-                world_w_m=world_w_m,
-                world_h_m=world_h_m,
-                stamp_debug_path=stamp_txt,
-            )
-
-        age_pack = _sector_scan_age_rgba_wgs84(
-            rec,
-            cov_geom,
-            (zx0, zy0, zx1, zy1),
-            always_on_reference=False,
-            xw_path=xs_a,
-            yw_path=ys_a,
-            h_path=h_pol,
-            poly=np.asarray(poly, dtype=np.float64),
-            graph_crs=str(crs),
-            world_w_m=world_w_m,
-            world_h_m=world_h_m,
-            stamp_debug_path=stamp_txt,
-        )
+        age_pack = _simulate_sector_walk_projected(
+            x_path=xg_policy,
+            y_path=yg_policy,
+            h_path=hg_policy,
+            path_crs=str(crs),
+            day_seg=day_seg_policy,
+            on_mask=on_policy_aug,
+            stamps=stamps_policy_aug,
+            cfg=cfg,
+            zoom_bounds_3857=(zx0, zy0, zx1, zy1),
+        )[2]
         age_layer_name = (
             "Map age — sim time of last sector scan (policy camera; s from episode start, turbo)"
         )
         if age_pack is None:
-            age_pack = _reference_sector_age_pack()
+            age_pack = _simulate_sector_walk_projected(
+                x_path=xg_walk,
+                y_path=yg_walk,
+                h_path=hg_walk,
+                path_crs=str(crs),
+                day_seg=day_seg_walk,
+                on_mask=on_all,
+                stamps=stamps_all,
+                cfg=cfg,
+                zoom_bounds_3857=(zx0, zy0, zx1, zy1),
+            )[2]
             age_layer_name = (
                 "Map age — sim time of last sector scan (always-on reference; "
                 "policy raster unavailable)"
@@ -1190,7 +2866,17 @@ def try_save_realworld_always_on_coverage(
         else:
             _a, _b, n_hit = age_pack
             if n_hit == 0:
-                ap2 = _reference_sector_age_pack()
+                ap2 = _simulate_sector_walk_projected(
+                    x_path=xg_walk,
+                    y_path=yg_walk,
+                    h_path=hg_walk,
+                    path_crs=str(crs),
+                    day_seg=day_seg_walk,
+                    on_mask=on_all,
+                    stamps=stamps_all,
+                    cfg=cfg,
+                    zoom_bounds_3857=(zx0, zy0, zx1, zy1),
+                )[2]
                 if ap2 is not None:
                     age_pack = ap2
                     age_layer_name = (
@@ -1203,15 +2889,32 @@ def try_save_realworld_always_on_coverage(
             age_rgba, age_bounds, _n_hit_out = age_pack
         colored_paths = home_daily_colored_paths_3857(rec)
         extra_fg = folium_feature_groups_home_daily(rec)
-        policy_cov_3857 = _policy_camera_coverage_union_3857(
-            rec,
-            xs_a,
-            ys_a,
-            np.asarray(poly, dtype=np.float64),
-            str(crs),
-            utm_crs,
-            cfg,
+        per_day_cov: list[tuple[str, str, Any]] = []
+        for d in sorted(cov_by_day_graph.keys()):
+            geom = cov_by_day_graph[d]
+            if geom.is_empty:
+                continue
+            geom3857 = gpd.GeoDataFrame(geometry=[geom], crs=str(crs)).to_crs(3857).geometry.iloc[0]
+            col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+            per_day_cov.append((f"Coverage â€” always-on Day {d + 1}", col, geom3857))
+        _policy_cov_graph, policy_by_day_graph, _policy_age_dup = _simulate_sector_walk_projected(
+            x_path=xg_policy,
+            y_path=yg_policy,
+            h_path=hg_policy,
+            path_crs=str(crs),
+            day_seg=day_seg_policy,
+            on_mask=on_policy_aug,
+            stamps=stamps_policy_aug,
+            cfg=cfg,
         )
+        policy_cov_layers: list[tuple[str, str, Any]] = []
+        for d in sorted(policy_by_day_graph.keys()):
+            geom = policy_by_day_graph[d]
+            if geom.is_empty:
+                continue
+            geom3857 = gpd.GeoDataFrame(geometry=[geom], crs=str(crs)).to_crs(3857).geometry.iloc[0]
+            col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
+            policy_cov_layers.append((f"Coverage â€” policy camera Day {d + 1}", col, geom3857))
         html_done = save_realworld_folium_html(
             out_path=out_html,
             coverage_3857=cov_geom,
@@ -1219,13 +2922,15 @@ def try_save_realworld_always_on_coverage(
             age_rgba=age_rgba,
             age_bounds_wgs84=age_bounds,
             title=(
-                "Open layers: path, coverage (always-on vs policy), map age (zoom box). "
-                "Scroll to zoom, drag to pan — " + base_title
+                "Open layers: path, always-on wedge coverage (green + per-day when multi-day), "
+                "policy wedge coverage per day (camera on), map age heatmap. Scroll to zoom, drag to pan — "
+                + base_title
             ),
             colored_path_layers_3857=colored_paths,
             extra_feature_groups=extra_fg,
             age_layer_name=age_layer_name,
-            policy_coverage_3857=policy_cov_3857,
+            per_day_coverage_layers_3857=per_day_cov,
+            policy_coverage_layers_3857=policy_cov_layers,
         )
         if html_done is not None:
             html_path = html_done

@@ -230,22 +230,30 @@ def train_reinforce(
             )
         for _ in inner_it:
             s = int(rng.integers(0, 2**31 - 1))
-            obs, _info = env.reset(seed=s)
+            obs, info = env.reset(seed=s)
             logps: list[torch.Tensor] = []
             entrs: list[torch.Tensor] = []
             rews: list[float] = []
+            had_policy_step = False
             while True:
-                x = torch.from_numpy(obs).float().to(dev).unsqueeze(0)
-                logits = policy.forward_logits(x)
-                dist = torch.distributions.Categorical(logits=logits)
-                a = dist.sample()
-                logps.append(dist.log_prob(a))
-                entrs.append(dist.entropy())
-                step = env.step(int(a.item()))
+                if bool(info.get("interval_is_moving", True)):
+                    x = torch.from_numpy(obs).float().to(dev).unsqueeze(0)
+                    logits = policy.forward_logits(x)
+                    dist = torch.distributions.Categorical(logits=logits)
+                    a = dist.sample()
+                    logps.append(dist.log_prob(a))
+                    entrs.append(dist.entropy())
+                    had_policy_step = True
+                    step = env.step(int(a.item()))
+                else:
+                    step = env.step(0)
                 rews.append(step.reward)
                 obs = step.observation
+                info = step.info
                 if step.terminated or step.truncated:
                     break
+            if not had_policy_step or not logps:
+                continue
             returns = _discounted_returns(rews, gamma)
             episode_g0.append(float(returns[0]))
             batch_logp.append(torch.stack(logps))

@@ -34,7 +34,10 @@ def generate_synthetic_episode_batch(
         act_l: list[int] = []
         rew_l: list[float] = []
         while True:
-            a = pol.act(obs, info)
+            if bool(info.get("interval_is_moving", True)):
+                a = pol.act(obs, info)
+            else:
+                a = 0
             st = env.step(a)
             act_l.append(a)
             rew_l.append(st.reward)

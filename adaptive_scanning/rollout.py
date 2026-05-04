@@ -23,9 +23,15 @@ def run_episode(env: CameraBudgetEnv, policy: Policy, *, seed: int | None = None
     obs, info = env.reset(seed=seed)
     total_r = 0.0
     on_steps = 0
+    moving_steps = 0
     steps = 0
     while True:
-        a = policy.act(obs, info)
+        is_moving = bool(info.get("interval_is_moving", True))
+        if is_moving:
+            moving_steps += 1
+            a = policy.act(obs, info)
+        else:
+            a = 0
         if a == 1:
             on_steps += 1
         step = env.step(a)
@@ -43,7 +49,7 @@ def run_episode(env: CameraBudgetEnv, policy: Policy, *, seed: int | None = None
         final_uncovered_fraction=final_u,
         final_mean_stale_normalized=final_s,
         mean_reward=total_r / max(steps, 1),
-        camera_on_fraction=on_steps / max(steps, 1),
+        camera_on_fraction=on_steps / max(moving_steps, 1),
     )
 
 
