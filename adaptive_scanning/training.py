@@ -293,6 +293,15 @@ def train_reinforce(
                 unc=f"{float(metrics['uncovered_mean']):.3f}",
                 on=f"{float(metrics['camera_on_mean']):.2f}",
             )
+        line = (
+            f"epoch {ep + 1}/{epochs} | loss={row['loss']:.6g} | "
+            f"return_mean={row['return_mean']:.4f} | uncovered_mean={row['uncovered_mean']:.4f} | "
+            f"stale_mean={row['stale_mean']:.4f} | camera_on_mean={row['camera_on_mean']:.4f}"
+        )
+        if tqdm_mod is not None:
+            tqdm_mod.write(line)
+        else:
+            print(line, flush=True)
 
     if pbar is not None:
         pbar.close()
