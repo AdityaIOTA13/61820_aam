@@ -178,6 +178,7 @@ class CameraBudgetEnv:
         self._budget_s = c.seconds_video_budget_per_day
         self._day_start_s = 0.0
         self.last_seen = np.full((c.ny, c.nx), -np.inf, dtype=np.float64)
+        self._last_day_boundary_reward: float = 0.0
 
         obs = self._observation()
         info = self._info_dict()
@@ -203,11 +204,22 @@ class CameraBudgetEnv:
             rng=self.rng,
         )
 
-    def _maybe_new_day(self) -> None:
+    def _maybe_new_day(self) -> float:
+        """
+        Advance calendar days when ``sim_time`` crosses ``day_duration_s`` boundaries.
+        Returns reward adjustment (typically <= 0): unused daily budget penalty per completed day.
+        """
         c = self.cfg
+        extra = 0.0
+        w_unused = float(getattr(c, "w_unused_budget_end_of_day", 0.0))
+        bmax = float(c.seconds_video_budget_per_day)
         while self._sim_time_s - self._day_start_s >= c.day_duration_s:
+            if w_unused != 0.0 and bmax > 1e-9:
+                unused_frac = max(0.0, min(1.0, float(self._budget_s) / bmax))
+                extra -= w_unused * unused_frac
             self._day_start_s += c.day_duration_s
-            self._budget_s = c.seconds_video_budget_per_day
+            self._budget_s = float(c.seconds_video_budget_per_day)
+        return float(extra)
 
     def _cell_centers_world(self) -> tuple[np.ndarray, np.ndarray]:
         c = self.cfg
@@ -361,6 +373,9 @@ class CameraBudgetEnv:
             "mean_stale_normalized": self._mean_stale_normalized(),
             "n_scanned_cells": int(np.sum(np.isfinite(self.last_seen))),
             "interval_is_moving": bool(self._current_interval_is_moving()),
+            "end_of_day_unused_budget_penalty": float(
+                getattr(self, "_last_day_boundary_reward", 0.0)
+            ),
         }
 
     def step(self, action: int) -> StepResult:
@@ -387,13 +402,15 @@ class CameraBudgetEnv:
             self._budget_s -= c.dt_s
 
         self._sim_time_s += c.dt_s
-        self._maybe_new_day()
+        day_reward = self._maybe_new_day()
+        self._last_day_boundary_reward = float(day_reward)
 
         self._step_idx += 1
         reward = self._reward()
         bonus = float(getattr(c, "reward_camera_on_bonus", 0.0))
         if actually_on and bonus != 0.0:
             reward += bonus
+        reward += day_reward
 
         max_steps = len(self._traj_x) - 1
         truncated = self._step_idx >= max_steps

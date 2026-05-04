@@ -35,6 +35,9 @@ class AdaptiveScanningConfig:
     stale_ref_s: float = 3600.0  # normalize ages for observation / local stale mean cap
     # Added to reward each step the camera is effectively on (RL bootstrap; 0 = pure coverage objective).
     reward_camera_on_bonus: float = 0.0
+    # At each simulated day boundary: subtract ``w_unused_budget_end_of_day * (unused_budget / seconds_video_budget_per_day)``.
+    # Unused fraction is leftover budget before the daily reset (0 = disable).
+    w_unused_budget_end_of_day: float = 0.1
 
     # Local egocentric patch (cells); must be odd
     patch_cells: int = 31

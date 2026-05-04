@@ -27,6 +27,7 @@ def _tiny_cfg():
         osm_daily_home_commute=False,
         osm_bbox=None,
         osm_place="",
+        w_unused_budget_end_of_day=0.0,
     )
 
 
@@ -140,6 +141,32 @@ def test_visualize_episode_skip_png_no_panel_file():
         )
         assert path is None
         assert not out.exists()
+
+
+def test_unused_budget_penalty_at_simulated_day_end():
+    cfg = AdaptiveScanningConfig(
+        nx=8,
+        ny=8,
+        resolution_m=2.0,
+        max_sim_time_s=500.0,
+        day_duration_s=100.0,
+        seconds_video_budget_per_day=50.0,
+        dt_s=10.0,
+        patch_cells=5,
+        w_unused_budget_end_of_day=1.0,
+        reward_camera_on_bonus=0.0,
+        motion_mode="box",
+        osm_daily_home_commute=False,
+        osm_bbox=None,
+        osm_place="",
+    )
+    env = CameraBudgetEnv(cfg, seed=0)
+    env.reset(seed=0)
+    last_pen = 0.0
+    for _ in range(10):
+        st = env.step(0)
+        last_pen = float(st.info.get("end_of_day_unused_budget_penalty", 0.0))
+    assert last_pen == pytest.approx(-1.0)
 
 
 def test_segment_day_indices_playback_per_day_si_bounds():

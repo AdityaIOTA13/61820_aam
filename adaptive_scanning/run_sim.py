@@ -208,8 +208,16 @@ def main(argv: list[str] | None = None) -> None:
     pt.add_argument(
         "--camera-on-bonus",
         type=float,
-        default=0.06,
-        help="Extra reward per env step when camera is effectively on (RL bootstrap). 0 disables.",
+        default=0.0,
+        help="Extra reward per env step when camera is effectively on (RL bootstrap). Default 0 (off).",
+    )
+    pt.add_argument(
+        "--unused-budget-penalty",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Weight on unused fraction of daily camera budget applied at each simulated day boundary "
+        "(subtract W × leftover_fraction). Omit to use AdaptiveScanningConfig.w_unused_budget_end_of_day.",
     )
     pt.add_argument("--out", type=str, default="", help="Optional path to save policy .pt")
     pt.add_argument(
@@ -348,7 +356,10 @@ def main(argv: list[str] | None = None) -> None:
         if vbm_tr > 0.0:
             cfg.seconds_video_budget_per_day = float(vbm_tr) * 60.0
 
-        cfg.reward_camera_on_bonus = float(getattr(args, "camera_on_bonus", 0.06))
+        cfg.reward_camera_on_bonus = float(args.camera_on_bonus)
+        ubp = getattr(args, "unused_budget_penalty", None)
+        if ubp is not None:
+            cfg.w_unused_budget_end_of_day = float(ubp)
 
         train_log: str | None = None
         if not bool(getattr(args, "no_train_log", False)):

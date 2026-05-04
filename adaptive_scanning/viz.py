@@ -1923,7 +1923,7 @@ def _simulate_sector_walk_projected(
         last_plot[hit] = last_scan[hit]
         last_plot[never_in_cov] = 0.0
         if np.any(np.isfinite(last_plot)):
-            rgba = _sim_time_grid_to_rgba_turbo(last_plot, vmin=0.0, vmax=max(final_t, 1.0))
+            rgba = _sim_time_grid_to_rgba_red_green(last_plot, vmin=0.0, vmax=max(final_t, 1.0))
             dx_merc = (xmax - xmin) / max(nx - 1, 1)
             dy_merc = (ymax - ymin) / max(ny - 1, 1)
             xmin_e = xmin - 0.5 * dx_merc
@@ -2062,17 +2062,22 @@ def _staleness_grid_to_rgba_rdylgn(
     return rgba
 
 
-def _sim_time_grid_to_rgba_turbo(
+def _sim_time_grid_to_rgba_red_green(
     time_s: np.ndarray,
     *,
     vmin: float,
     vmax: float,
     alpha: int = 238,
 ) -> np.ndarray:
-    """``time_s`` NaN = transparent. Finite values mapped linearly ``vmin``…``vmax`` with ``turbo``."""
+    """
+    ``time_s`` NaN = transparent.
+
+    Finite values are mapped linearly from ``vmin`` to ``vmax`` using one continuous
+    red→yellow→green ramp, where later scan times in the session are greener.
+    """
     from matplotlib import colormaps
 
-    cmap = colormaps["turbo"]
+    cmap = colormaps["RdYlGn"]
     mnan = np.isnan(time_s)
     if vmax <= vmin:
         vmax = vmin + 1.0
@@ -2292,7 +2297,7 @@ def _sector_scan_age_rgba_wgs84(
         return None
 
     ft = max(final_t, 1.0)
-    rgba = _sim_time_grid_to_rgba_turbo(last_plot, vmin=0.0, vmax=ft)
+    rgba = _sim_time_grid_to_rgba_red_green(last_plot, vmin=0.0, vmax=ft)
 
     if stamp_debug_path is not None:
         lines = [
@@ -2331,13 +2336,13 @@ def _sector_scan_age_rgba_wgs84(
         )
         if lv.size:
             lines.append(
-                f"last_plot (sim_s used for turbo color, 0=discretization gap): "
+                f"last_plot (sim_s used for red-green color, 0=discretization gap): "
                 f"min={float(np.nanmin(lv)):.6g} max={float(np.nanmax(lv)):.6g} "
                 f"mean={float(np.nanmean(lv)):.6g} p5={float(np.percentile(lv, 5)):.6g} "
                 f"p95={float(np.percentile(lv, 95)):.6g}"
             )
         lines.append("")
-        lines.append(f"turbo_vmin=0 turbo_vmax={ft}")
+        lines.append(f"session_time_vmin=0 session_time_vmax={ft}")
         stamp_debug_path.parent.mkdir(parents=True, exist_ok=True)
         stamp_debug_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -2475,7 +2480,7 @@ def _sector_scan_age_rgba_projected_wgs84(
     if not np.any(np.isfinite(last_plot)):
         return None
 
-    rgba = _sim_time_grid_to_rgba_turbo(last_plot, vmin=0.0, vmax=max(final_t, 1.0))
+    rgba = _sim_time_grid_to_rgba_red_green(last_plot, vmin=0.0, vmax=max(final_t, 1.0))
     dx_merc = (xmax - xmin) / max(nx - 1, 1)
     dy_merc = (ymax - ymin) / max(ny - 1, 1)
     xmin_e = xmin - 0.5 * dx_merc
@@ -2569,7 +2574,7 @@ def try_save_realworld_always_on_coverage(
       3) ``*_coverage_realworld_map.html`` — Folium (if ``folium`` installed): path,
          **always-on** coverage (green), **per-day** always-on wedges when multi-day playback,
          **per-day policy** wedge unions when the camera is on (world path + same stride/radius as green),
-         optional **map-age** raster (``turbo``).
+         optional **map-age** raster (session-time red→green).
 
     **Coverage vs map age:** the green GeoJSON is motion-integrated **UTM** wedges along the
     resampled OSM polyline (with ``stride`` when ``n_scan`` is large). **Policy** GeoJSON samples
@@ -2845,7 +2850,7 @@ def try_save_realworld_always_on_coverage(
             zoom_bounds_3857=(zx0, zy0, zx1, zy1),
         )[2]
         age_layer_name = (
-            "Map age — sim time of last sector scan (policy camera; s from episode start, turbo)"
+            "Map age — sim time of last sector scan (policy camera; session seconds from start, red→green)"
         )
         if age_pack is None:
             age_pack = _simulate_sector_walk_projected(
