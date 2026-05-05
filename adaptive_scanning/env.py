@@ -536,11 +536,62 @@ class CameraBudgetEnv:
         ay = float(self._traj_y[self._step_idx])
         hd = float(self._traj_h[self._step_idx])
 
-        pc = c.patch_cells
-        half = pc // 2
         ix0 = int(ax // c.resolution_m)
         iy0 = int(ay // c.resolution_m)
 
+        frac_day = (self._sim_time_s - self._day_start_s) / c.day_duration_s
+        frac_day = float(np.clip(frac_day, 0.0, 1.0))
+        tod = 2 * math.pi * frac_day
+
+        bmax = float(daily_video_budget_seconds(c))
+        glo = np.array(
+            [
+                self._budget_s / max(bmax, 1e-6),
+                math.sin(tod),
+                math.cos(tod),
+                math.sin(hd),
+                math.cos(hd),
+                ax / max(self.world_w_m, 1e-6),
+                ay / max(self.world_h_m, 1e-6),
+            ],
+            dtype=np.float32,
+        )
+        if str(getattr(c, "observation_mode", "patch")) == "foot_cell":
+            ls = float(self.last_seen[iy0, ix0]) if (0 <= iy0 < c.ny and 0 <= ix0 < c.nx) else float("nan")
+            lf = (
+                float(self._last_seen_foot[iy0, ix0])
+                if (self._last_seen_foot is not None and 0 <= iy0 < c.ny and 0 <= ix0 < c.nx)
+                else float("nan")
+            )
+            T = float(self._sim_time_s)
+            min_wedge0 = max(
+                float(getattr(c, "greedy_unseen_wedge_suppress_min_age_s", 3600.0)),
+                10.0 * float(c.dt_s),
+            )
+            tau0 = max(float(getattr(c, "greedy_unseen_coverage_grace_seconds", 0.0)), 0.0)
+            w_eve = float(self._greedy_unseen_evening_leniency())
+            wm = float(getattr(c, "evening_lenient_wedge_suppress_age_mult", 1.0))
+            fm = float(getattr(c, "evening_lenient_foot_grace_mult", 1.0))
+            tau = tau0 * (1.0 + w_eve * max(0.0, fm - 1.0))
+            min_wedge_s = min_wedge0 * (1.0 + w_eve * max(0.0, wm - 1.0))
+            prior_foot = bool(np.isfinite(lf) and (T - lf > tau + 1e-9))
+            prior_wedge = bool(np.isfinite(ls) and (T - ls > min_wedge_s + 1e-9))
+            foot = np.array(
+                [
+                    1.0 if np.isfinite(ls) else 0.0,
+                    float(min(1.0, max(0.0, (T - ls) / max(c.stale_ref_s, 1e-6)))) if np.isfinite(ls) else 0.0,
+                    1.0 if np.isfinite(lf) else 0.0,
+                    float(min(1.0, max(0.0, (T - lf) / max(c.stale_ref_s, 1e-6)))) if np.isfinite(lf) else 0.0,
+                    1.0 if prior_foot else 0.0,
+                    1.0 if prior_wedge else 0.0,
+                    1.0 if (not (prior_foot or prior_wedge)) else 0.0,
+                ],
+                dtype=np.float32,
+            )
+            return np.concatenate([foot, glo], axis=0).astype(np.float32)
+
+        pc = c.patch_cells
+        half = pc // 2
         ch0 = np.zeros((pc, pc), dtype=np.float32)
         ch1 = np.zeros((pc, pc), dtype=np.float32)
         for di in range(-half, half + 1):
@@ -561,24 +612,6 @@ class CameraBudgetEnv:
                     # local greedy rules are not dominated by padding near bbox edges.
                     ch0[pi, pj] = 1.0
                     ch1[pi, pj] = 0.0
-
-        frac_day = (self._sim_time_s - self._day_start_s) / c.day_duration_s
-        frac_day = float(np.clip(frac_day, 0.0, 1.0))
-        tod = 2 * math.pi * frac_day
-
-        bmax = float(daily_video_budget_seconds(c))
-        glo = np.array(
-            [
-                self._budget_s / max(bmax, 1e-6),
-                math.sin(tod),
-                math.cos(tod),
-                math.sin(hd),
-                math.cos(hd),
-                ax / max(self.world_w_m, 1e-6),
-                ay / max(self.world_h_m, 1e-6),
-            ],
-            dtype=np.float32,
-        )
         patch = np.stack([ch0, ch1], axis=0).astype(np.float32)
         flat_patch = patch.reshape(-1)
         return np.concatenate([flat_patch, glo], axis=0).astype(np.float32)
@@ -665,4 +698,6 @@ class CameraBudgetEnv:
     @property
     def observation_dim(self) -> int:
         c = self.cfg
+        if str(getattr(c, "observation_mode", "patch")) == "foot_cell":
+            return 7 + 7
         return 2 * c.patch_cells * c.patch_cells + 7

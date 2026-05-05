@@ -301,6 +301,13 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Disable training logs even when --out would imply a default log directory",
     )
+    pt.add_argument(
+        "--observation-mode",
+        type=str,
+        choices=("foot_cell", "patch"),
+        default=None,
+        help="Env observation for RL policy: foot_cell (current cell features) or patch (local raster).",
+    )
     _add_street_cli_args(pt)
     _add_home_commute_cli_args(pt)
 
@@ -353,6 +360,13 @@ def main(argv: list[str] | None = None) -> None:
         metavar="M_S",
         help="If set: video_budget_reference_walk_speed_m_s (0 = no walk-speed scaling of daily budget). Omit for config default.",
     )
+    pv.add_argument(
+        "--observation-mode",
+        type=str,
+        choices=("foot_cell", "patch"),
+        default=None,
+        help="Override env observation mode when running visualize/eval policy episodes.",
+    )
     _add_home_commute_cli_args(pv)
     _add_street_cli_args(pv)
 
@@ -388,6 +402,9 @@ def main(argv: list[str] | None = None) -> None:
     cfg: AdaptiveScanningConfig = _fast_cfg() if use_fast else _default_cfg()
     _merge_street_cli(cfg, args)
     _apply_home_commute_cli(cfg, args)
+    obs_mode = getattr(args, "observation_mode", None)
+    if obs_mode:
+        cfg.observation_mode = str(obs_mode)
 
     if args.cmd == "eval":
         from adaptive_scanning.policies import (

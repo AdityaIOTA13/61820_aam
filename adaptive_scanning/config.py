@@ -69,7 +69,12 @@ class AdaptiveScanningConfig:
     # Revisits do not refresh timestamps (reduces meaningless "rescan" map churn). Default False for RL.
     update_last_seen_only_on_first_hit: bool = False
 
-    # Local egocentric patch (cells); must be odd
+    # RL observation mode:
+    # - "patch": 2-channel local patch (ever-scanned + age) + global features
+    # - "foot_cell": current-cell scan state/age features (greedy-unseen-like) + global features
+    observation_mode: Literal["patch", "foot_cell"] = "foot_cell"
+
+    # Local egocentric patch (cells); must be odd (used when observation_mode="patch")
     patch_cells: int = 31
 
     # Motion: ``streets`` = OSM shortest-path style walks; ``box`` = random rectangle (use e.g. --fast CLI).

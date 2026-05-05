@@ -336,7 +336,20 @@ def load_policy(path: str, device: str | None = None) -> tuple[MLPPolicy, Adapti
         ckpt = torch.load(path, map_location=dev)
     cfg = config_from_saved_dict(ckpt["cfg"])
     env = CameraBudgetEnv(cfg)
+    state = ckpt["state_dict"]
+    net0_w = state.get("net.0.weight")
+    if isinstance(net0_w, torch.Tensor):
+        saved_in = int(net0_w.shape[1])
+        if env.observation_dim != saved_in:
+            from dataclasses import replace
+
+            for mode in ("patch", "foot_cell"):
+                cfg_try = replace(cfg, observation_mode=mode)
+                if CameraBudgetEnv(cfg_try).observation_dim == saved_in:
+                    cfg = cfg_try
+                    env = CameraBudgetEnv(cfg)
+                    break
     pol = MLPPolicy(env.observation_dim).to(dev)
-    pol.load_state_dict(ckpt["state_dict"])
+    pol.load_state_dict(state)
     pol.eval()
     return pol, cfg

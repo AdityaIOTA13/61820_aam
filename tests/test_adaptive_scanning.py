@@ -64,6 +64,17 @@ def test_env_steps_and_budget_reset():
     assert budget_hits > 0
 
 
+def test_foot_cell_observation_mode_shape_and_signal():
+    cfg = replace(_tiny_cfg(), observation_mode="foot_cell")
+    env = CameraBudgetEnv(cfg, seed=0)
+    obs, _info = env.reset(seed=0)
+    assert obs.shape[0] == env.observation_dim == 14
+    # First 7 dims are foot-cell features; with never-scanned start, "ever" flags are zero.
+    assert float(obs[0]) == pytest.approx(0.0)
+    assert float(obs[2]) == pytest.approx(0.0)
+    assert float(obs[6]) == pytest.approx(1.0)
+
+
 def test_greedy_unseen_wedge_revisit_vs_same_pass():
     """Recent wedge on foot cell does not suppress; old wedge (multi-step / revisit) does; foot + grace."""
     cfg = _tiny_cfg()
