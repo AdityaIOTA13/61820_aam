@@ -184,12 +184,76 @@ python scripts/simulate_revisit_days.py --reset-coverage --json-out outputs/revi
 
 ---
 
+## 3D Reconstruction (COLMAP)
+
+`scripts/prepare_colmap.py` selects frames via a greedy staleness policy and crops a forward-facing perspective patch (100° HFOV, 1280×720) from each equirectangular frame, then prints ready-to-run COLMAP commands.
+
+```bash
+# Select 36 frames via greedy budget policy, crop perspective patches, print COLMAP commands
+python scripts/prepare_colmap.py --budget 36
+
+# Or use all 183 frames (always-on baseline)
+python scripts/prepare_colmap.py --all
+```
+
+**Run COLMAP** (requires `colmap` — `brew install colmap` on macOS):
+
+```bash
+colmap feature_extractor \
+    --database_path outputs/colmap_input/budget36/database.db \
+    --image_path outputs/colmap_input/budget36/images/ \
+    --ImageReader.camera_model PINHOLE --ImageReader.single_camera 1
+
+colmap exhaustive_matcher --database_path outputs/colmap_input/budget36/database.db
+
+mkdir -p outputs/colmap_input/budget36/sparse
+colmap mapper \
+    --database_path outputs/colmap_input/budget36/database.db \
+    --image_path outputs/colmap_input/budget36/images/ \
+    --output_path outputs/colmap_input/budget36/sparse/
+```
+
+**Pre-run result (budget36):** 33/36 frames registered, **10,998 3D points**, mean reprojection error **0.84 px**.
+
+**View in COLMAP GUI** (after running mapper):
+```bash
+colmap gui \
+    --import_path outputs/colmap_input/budget36/sparse/0/ \
+    --database_path outputs/colmap_input/budget36/database.db \
+    --image_path outputs/colmap_input/budget36/images/
+```
+
+**Download sparse PLY** (open in MeshLab / CloudCompare / Blender):
+```
+https://assets02.aitkena.com/courtyard_360/colmap_sparse_budget36.ply
+```
+
+See `outputs/colmap_input/budget36/reconstruction_preview.png` for a top-down + side static preview.
+
+---
+
+## Pre-computed Outputs (R2 CDN)
+
+| Asset | Public URL |
+|---|---|
+| Frames (183 JPEGs, 2 fps) | `https://assets02.aitkena.com/courtyard_360/frames/frame_NNNNN_T.TTTs.jpg` |
+| Depth maps (183 PNGs) | `https://assets02.aitkena.com/courtyard_360/depth_maps/frame_NNNNN_T.TTTs_depth.png` |
+| Frame positions JSON | `https://assets02.aitkena.com/courtyard_360/frame_positions.json` |
+| Depth timelapse video | `https://assets02.aitkena.com/courtyard_360/depth_timelapse.mp4` |
+| 7-day revisit simulation | `https://assets02.aitkena.com/courtyard_360/revisit_sim.mp4` |
+| COLMAP sparse PLY (budget36) | `https://assets02.aitkena.com/courtyard_360/colmap_sparse_budget36.ply` |
+| Raw 360° video | `https://assets02.aitkena.com/courtyard_360/VID_20260429_143550_00_014.mp4` |
+
+---
+
 ## Next Steps
 
-- [x] `project_coverage.py` — floorplane projection + map-age / ever-seen heatmaps (`outputs/coverage/`)
-- [x] Per-frame FOV masking — `--hfov-deg` / `--vfov-deg` (default ~100° Ray-Ban Meta style), or `--fov-full-360`
+- [x] `project_coverage.py` — map-age / ever-seen heatmaps (`outputs/coverage/`)
+- [x] Per-frame FOV masking — `--hfov-deg` / `--vfov-deg` (default 100 deg Ray-Ban Meta style)
+- [x] 3D reconstruction — COLMAP sparse SfM from policy-selected perspective crops (`prepare_colmap.py`)
+- [ ] Dense reconstruction — COLMAP dense or NeRF/Gaussian Splatting on registered frames
 - [ ] Coverage metric: fraction of courtyard area observed at each depth threshold
-- [ ] **Temporal scan-order visuals** — The current heatmap encodes **staleness at the end of the walk** (time since *last* hit per cell), not *first* hit time or a time-lapse. A separate “temporal coverage” item would add e.g. first-seen timestamp colouring or an animated GIF over `timestamp_sec`.
+- [ ] Temporal scan-order visuals — animated coverage GIF over `timestamp_sec`
 
 ---
 
