@@ -27,7 +27,7 @@ htmlcov/
 coverage.xml
 
 # Generated / local caches (OSM pickles, run artifacts, figures, policies, etc.)
-outputs/
+# outputs/ — selectively gitignored below; small PNGs/JSON are committed
 cache/
 
 # Large raw data (hosted on R2 CDN instead)
