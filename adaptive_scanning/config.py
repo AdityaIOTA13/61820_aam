@@ -1,9 +1,27 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, fields
+from typing import Any, Literal
 
 from adaptive_scanning.street_trajectories import MIT_CAMPUS_BBOX_WGS84
+
+
+def config_from_saved_dict(saved: dict[str, Any]) -> AdaptiveScanningConfig:
+    """
+    Rebuild ``AdaptiveScanningConfig`` from a checkpoint ``cfg`` mapping.
+
+    Drops keys that no longer exist on the dataclass (forward compat for old .pt files) and
+    applies defaults for any field missing from the save (backward compat after new fields).
+    """
+    valid = {f.name for f in fields(AdaptiveScanningConfig)}
+    kw: dict[str, Any] = {}
+    for k, v in saved.items():
+        if k not in valid:
+            continue
+        if k == "osm_bbox" and v is not None and isinstance(v, list):
+            v = tuple(float(x) for x in v)
+        kw[k] = v
+    return AdaptiveScanningConfig(**kw)
 
 
 @dataclass
@@ -15,7 +33,9 @@ class AdaptiveScanningConfig:
     ny: int = 64
     resolution_m: float = 2.0
 
-    # Sector sensor (horizontal wedge in the xy plane)
+    # Sector sensor (horizontal wedge in the xy plane). Radius is in ground / graph metres
+    # (same as Folium wedge geometry); street episodes letterbox graph into the env grid, and
+    # the env applies the matching scale so sector coverage matches that radius on the map.
     hfov_deg: float = 100.0
     scan_radius_m: float = 30.0
 
@@ -23,8 +43,13 @@ class AdaptiveScanningConfig:
     # 30 s → fewer env steps per max_sim_time_s (faster rollouts; coarser control).
     dt_s: float = 30.0
     day_duration_s: float = 8 * 3600.0  # one "walking day" in sim time
-    # ~5 min/day scanning budget (SI seconds of effective camera-on per day_duration_s window).
-    seconds_video_budget_per_day: float = 300.0
+    # SI seconds of effective camera-on budget each time the daily budget resets.
+    # Interpreted at ``video_budget_reference_walk_speed_m_s`` (default equals ``walk_speed_m_s`` default):
+    # effective budget is ``seconds_video_budget_per_day * (reference / walk_speed_m_s)`` so that
+    # ``walk_speed * budget_seconds`` (order-of-magnitude path metres while recording) stays stable
+    # when you change walking speed; set reference to 0 to keep a fixed SI second cap regardless of speed.
+    seconds_video_budget_per_day: float = 600.0  # 10 min/day camera-on budget (SI seconds)
+    video_budget_reference_walk_speed_m_s: float = 1.35
 
     # Episode length in simulated time (budget resets each day_duration_s within this span)
     max_sim_time_s: float = 4 * 8 * 3600.0  # 4×8 h walking days (matches MIT home-commute demos)
@@ -35,9 +60,14 @@ class AdaptiveScanningConfig:
     stale_ref_s: float = 3600.0  # normalize ages for observation / local stale mean cap
     # Added to reward each step the camera is effectively on (RL bootstrap; 0 = pure coverage objective).
     reward_camera_on_bonus: float = 0.0
-    # At each simulated day boundary: subtract ``w_unused_budget_end_of_day * (unused_budget / seconds_video_budget_per_day)``.
+    # At each simulated day boundary: subtract ``w_unused_budget_end_of_day * (unused_budget / daily_cap_s)``;
+    # ``daily_cap_s`` matches the env (includes walk-speed scaling when reference speed > 0).
     # Unused fraction is leftover budget before the daily reset (0 = disable).
     w_unused_budget_end_of_day: float = 0.1
+
+    # If True, sector scans only write ``last_seen`` on cells that were never finite before (first hit).
+    # Revisits do not refresh timestamps (reduces meaningless "rescan" map churn). Default False for RL.
+    update_last_seen_only_on_first_hit: bool = False
 
     # Local egocentric patch (cells); must be odd
     patch_cells: int = 31
@@ -62,6 +92,33 @@ class AdaptiveScanningConfig:
     # When building day 2+, each intermediate stop is chosen from prior days' stops with this probability
     # (otherwise a new random node); home stays fixed for the episode.
     osm_repeat_destination_across_days_p: float = 0.35
+    # When a prior stop is reused, sample stops with weight ~ recency^(days since that stop's day).
+    # 1.0 = uniform over all prior stops (strong day-1 vs day-3 corridor overlap). Values below 1
+    # favor yesterday's destinations and reduce long-gap geographic reuse in multi-day episodes.
+    osm_repeat_prior_stops_recency: float = 0.55
+
+    # Late-day leniency for ``_foot_cell_greedy_unseen_on`` (greedy-unseen heuristic): after this
+    # many SI seconds since the **start of the current simulated day** (``env._day_start_s``), ramp up
+    # foot grace and wedge suppress age so mildly stale cells are likelier to get camera-on. This uses
+    # only elapsed time since day start — no dependence on ``day_duration_s`` or “how long the day is”.
+    # Set to a negative value to disable.
+    evening_lenient_after_s_since_day_start: float = 5.5 * 3600.0
+    # Linear ramp: leniency weight goes from 0→1 over this many seconds after ``evening_lenient_after_*``.
+    evening_lenient_ramp_s: float = 3600.0
+    evening_lenient_wedge_suppress_age_mult: float = 2.25
+    evening_lenient_foot_grace_mult: float = 4.0
+    # Only blend in leniency when this much daily video budget remains (fraction in [0, 1]).
+    evening_lenient_min_budget_frac: float = 0.12
+
+    # For ``BudgetAwareGreedyUnseenOnlyPolicy``: foot cell counts as already covered only if
+    # ``_last_seen_foot`` is older than this many SI seconds before ``sim_time_s``. Fresher foot
+    # stamps are ignored for the OFF decision.
+    greedy_unseen_coverage_grace_seconds: float = 2.0
+    # Wedge ``last_seen`` on the foot cell suppresses the camera only if this age (sim minus stamp)
+    # exceeds this minimum (seconds). Too small a value causes gaps: with ``update_last_seen_only_on_first_hit``
+    # or short camera-off runs, ``last_seen`` stops refreshing while ``sim_time`` advances, so cells read
+    # as ``old`` and greedy stays OFF. Use ~1 h so same-day motion is not mistaken for a multi-day revisit.
+    greedy_unseen_wedge_suppress_min_age_s: float = 3600.0
 
     # Random motion (box mode)
     walk_speed_m_s: float = 1.35  # ~4.9 km/h typical adult walking

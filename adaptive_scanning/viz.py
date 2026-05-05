@@ -25,6 +25,7 @@ def record_episode(
     traj_src = str(info0.get("trajectory_source", "?"))
     act_req: list[int] = []
     act_eff: list[float] = []
+    move_eff: list[float] = []
     sim_t: list[float] = []
     budget: list[float] = []
 
@@ -37,6 +38,7 @@ def record_episode(
         inf = st.info
         act_req.append(int(inf["action_requested"]))
         act_eff.append(1.0 if inf["camera_on_effective"] else 0.0)
+        move_eff.append(1.0 if inf.get("step_interval_is_moving", True) else 0.0)
         sim_t.append(float(inf["sim_time_s"]))
         budget.append(float(inf["budget_s"]))
         obs = st.observation
@@ -57,6 +59,7 @@ def record_episode(
         "ys": ys,
         "action_requested": np.array(act_req, dtype=np.int8),
         "camera_on_effective": np.array(act_eff, dtype=np.float32),
+        "step_interval_is_moving": np.array(move_eff, dtype=np.float32),
         "sim_time_s": np.array(sim_t, dtype=np.float64),
         "budget_s": np.array(budget, dtype=np.float64),
         "last_seen": env.last_seen.copy(),
@@ -117,14 +120,17 @@ def save_episode_figure(
     fig.colorbar(sc, ax=ax0, shrink=0.6, label="step index")
 
     ax1 = axes[1]
+    # Equal aspect so one metre on x equals one metre on y; ``aspect="auto"`` stretches the
+    # subplot and makes sector coverage look artificially wide compared to the path and to OSM wedges.
     im = ax1.imshow(
         age,
         origin="lower",
         extent=[0, cfg.nx * cfg.resolution_m, 0, cfg.ny * cfg.resolution_m],
-        aspect="auto",
+        aspect="equal",
         cmap="magma_r",
         interpolation="nearest",
     )
+    ax1.set_aspect("equal", adjustable="box")
     ax1.plot(xs, ys, "c-", linewidth=1.2, alpha=0.7)
     ax1.set_xlabel("x (m)")
     ax1.set_ylabel("y (m)")
@@ -431,8 +437,13 @@ def _segment_day_indices_playback(rec: dict[str, Any], nseg: int) -> np.ndarray 
 
 def _moving_segment_day_indices_playback(rec: dict[str, Any], nseg: int) -> np.ndarray | None:
     """
-    Map each **moving-route** segment ``k`` (the same segment stream used by green always-on
-    coverage) to playback ``day_index`` using moving-cumulative time ``k * dt_s``.
+    Map each **episode** motion segment ``k`` (same ``k`` as ``sim_time_s[k]`` / env step ``k``)
+    to playback ``day_index`` by overlapping the segment's SI wall window
+    ``[sim_time_s[k]-dt_s, sim_time_s[k]]`` with each **travel** event's ``[t_start_s, t_end_s]``.
+
+    Dwell/home steps have no travel overlap; we fall back to ``_segment_day_indices_playback``
+    (all playback phases). Using ``k * dt_s`` as a moving-time index was incorrect when ``nseg``
+    is the full episode length while travel only advances during legs.
     """
     if nseg < 1:
         return None
@@ -444,6 +455,9 @@ def _moving_segment_day_indices_playback(rec: dict[str, Any], nseg: int) -> np.n
         return None
     cfg: AdaptiveScanningConfig = rec["cfg"]
     dt_s = float(cfg.dt_s)
+    sim_arr = np.asarray(rec.get("sim_time_s"), dtype=np.float64).ravel()
+    if sim_arr.size < nseg:
+        return None
 
     travel: list[tuple[float, float, int]] = []
     for ev in evs:
@@ -452,38 +466,32 @@ def _moving_segment_day_indices_playback(rec: dict[str, Any], nseg: int) -> np.n
         if ev.get("day_index") is None:
             continue
         di = int(ev["day_index"])
-        m0 = float(ev.get("t_moving_cumulative_at_start_s", 0.0))
-        m1 = float(ev.get("t_moving_cumulative_at_end_s", m0))
-        if m1 < m0:
-            m0, m1 = m1, m0
-        travel.append((m0, m1, di))
+        t0 = float(ev.get("t_start_s", 0.0))
+        t1 = float(ev.get("t_end_s", t0))
+        if t1 < t0:
+            t0, t1 = t1, t0
+        travel.append((t0, t1, di))
     if not travel:
-        return None
+        return _segment_day_indices_playback(rec, nseg)
+
+    fb = _segment_day_indices_playback(rec, nseg)
 
     out = np.empty(nseg, dtype=np.int32)
     for k in range(nseg):
-        t = float(k) * dt_s
-        cands = [di for m0, m1, di in travel if m0 - 1e-6 <= t <= m1 + 1e-6]
-        if len(cands) == 1:
-            out[k] = int(cands[0])
-        elif len(cands) > 1:
-            best_di = cands[0]
-            best_m0 = -float("inf")
-            for m0, _m1, di in travel:
-                if di in cands and m0 > best_m0:
-                    best_m0 = m0
-                    best_di = di
-            out[k] = int(best_di)
+        w1 = float(sim_arr[k])
+        w0 = w1 - dt_s
+        best: list[tuple[float, int]] = []
+        for t0, t1, di in travel:
+            ov0 = max(w0, t0)
+            ov1 = min(w1, t1)
+            if ov1 <= ov0 + 1e-9:
+                continue
+            best.append((t0, di))
+        if not best:
+            out[k] = int(fb[k]) if fb is not None else 0
         else:
-            best_di = int(travel[0][2])
-            best_dist = float("inf")
-            for m0, m1, di in travel:
-                mid = 0.5 * (m0 + m1)
-                dist = abs(t - mid)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_di = int(di)
-            out[k] = best_di
+            _, di_pick = max(best, key=lambda row: (row[0], row[1]))
+            out[k] = int(di_pick)
     return out
 
 
@@ -606,10 +614,13 @@ def _policy_on_moving_segments(rec: dict[str, Any], nseg: int) -> np.ndarray | N
             dur = max(t1 - t0, 1e-9)
             frac0 = (ov0 - t0) / dur
             frac1 = (ov1 - t0) / dur
-            m0 = float(ev["m0"]) + frac0 * (float(ev["m1"]) - float(ev["m0"]))
-            m1 = float(ev["m0"]) + frac1 * (float(ev["m1"]) - float(ev["m0"]))
-            i0 = max(0, int(math.floor((m0 + 1e-9) / dt_s)))
-            i1 = min(nseg - 1, int(math.ceil((m1 - 1e-9) / dt_s)) - 1)
+            g0 = float(ev["m0"]) + frac0 * (float(ev["m1"]) - float(ev["m0"]))
+            g1 = float(ev["m0"]) + frac1 * (float(ev["m1"]) - float(ev["m0"]))
+            if g1 < g0:
+                g0, g1 = g1, g0
+            g1 = max(g1, g0 + 1e-9)
+            i0 = max(0, int(math.floor(g0 / dt_s)))
+            i1 = min(nseg - 1, int(math.floor((g1 - 1e-9) / dt_s)))
             if i1 >= i0:
                 out[i0 : i1 + 1] = True
     return out
@@ -763,12 +774,16 @@ def _policy_on_day_segments_from_playback(
             dur = max(t1 - t0, 1e-9)
             frac0 = (ov0 - t0) / dur
             frac1 = (ov1 - t0) / dur
-            m0 = float(ev["m0"]) + frac0 * (float(ev["m1"]) - float(ev["m0"])) - day_m0
-            m1 = float(ev["m0"]) + frac1 * (float(ev["m1"]) - float(ev["m0"])) - day_m0
-            i0 = max(0, int(math.floor((m0 + 1e-9) / dt_s)))
-            i1 = min(nseg_day - 1, int(math.ceil((m1 - 1e-9) / dt_s)) - 1)
-            if i1 >= i0:
-                out[i0 : i1 + 1] = True
+            g0 = float(ev["m0"]) + frac0 * (float(ev["m1"]) - float(ev["m0"])) - day_m0
+            g1 = float(ev["m0"]) + frac1 * (float(ev["m1"]) - float(ev["m0"])) - day_m0
+            if g1 < g0:
+                g0, g1 = g1, g0
+            # Resampled segment i covers local moving time [i*dt_s, (i+1)*dt_s) along the day's route.
+            g1 = max(g1, g0 + 1e-9)
+            ia = max(0, int(math.floor(g0 / dt_s)))
+            ib = min(nseg_day - 1, int(math.floor((g1 - 1e-9) / dt_s)))
+            if ib >= ia:
+                out[ia : ib + 1] = True
     return out
 
 
@@ -1017,7 +1032,7 @@ def home_daily_per_day_coverage_layers_3857(
                 continue
             g3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
             col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
-            layers.append((f"Coverage â€” always-on Day {d + 1}", col, g3857))
+            layers.append((f"Coverage — always-on Day {d + 1}", col, g3857))
         return layers if layers else None
     from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph
 
@@ -1090,7 +1105,7 @@ def home_daily_per_day_coverage_layers_3857(
                             geometry=[uu], crs=str(graph_crs)
                         ).to_crs(3857).geometry.iloc[0]
                         col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
-                        layers_actual.append((f"Coverage â€” policy camera Day {d + 1}", col, g3857))
+                        layers_actual.append((f"Coverage — policy camera Day {d + 1}", col, g3857))
                     if layers_actual:
                         return layers_actual
 
@@ -1271,7 +1286,7 @@ def policy_camera_coverage_layers_3857_by_day(
                             geometry=[uu], crs=str(graph_crs)
                         ).to_crs(3857).geometry.iloc[0]
                         col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
-                        layers_actual.append((f"Coverage â€” policy camera Day {d + 1}", col, g3857))
+                        layers_actual.append((f"Coverage — policy camera Day {d + 1}", col, g3857))
                     if layers_actual:
                         return layers_actual
 
@@ -1664,7 +1679,7 @@ def policy_camera_coverage_layers_3857_v4(
                 continue
             geom3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
             col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
-            layers.append((f"Coverage â€” policy camera Day {d + 1}", col, geom3857))
+            layers.append((f"Coverage — policy camera Day {d + 1}", col, geom3857))
         return layers if layers else None
 
     xg = np.asarray(x_graph, dtype=np.float64).ravel()
@@ -1716,7 +1731,7 @@ def policy_camera_coverage_layers_3857_v4(
             continue
         geom3857 = gpd.GeoDataFrame(geometry=[uu], crs=str(graph_crs)).to_crs(3857).geometry.iloc[0]
         col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
-        layers.append((f"Coverage â€” policy camera Day {d + 1}", col, geom3857))
+        layers.append((f"Coverage — policy camera Day {d + 1}", col, geom3857))
     return layers if layers else None
 
 
@@ -2563,6 +2578,294 @@ def _save_coverage_mpl_png(
     plt.close(fig)
 
 
+def folium_feature_group_policy_decisions(rec: dict[str, Any]) -> Any | None:
+    """
+    Folium layer: one small dot at each env step where ``policy.act`` ran (``rec["xs"], rec["ys"]``
+    at the step index, same frame as ``action_requested``).
+
+    Green = requested camera on; gray = requested off; orange = requested on but not effectively on
+    (budget / stationary clamp). Requires ``polyline_graph_m`` + ``graph_crs`` for world→graph affine.
+    """
+    try:
+        import folium
+        import geopandas as gpd
+        from shapely.geometry import Point
+    except ImportError:
+        return None
+
+    from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph
+
+    poly = rec.get("polyline_graph_m")
+    crs = rec.get("graph_crs")
+    if poly is None or crs is None:
+        return None
+    xs = np.asarray(rec.get("xs"), dtype=np.float64).ravel()
+    ys = np.asarray(rec.get("ys"), dtype=np.float64).ravel()
+    act = np.asarray(rec.get("action_requested"), dtype=np.int32).ravel()
+    if xs.size < 1 or act.size < 1:
+        return None
+    n = int(min(act.size, xs.size))
+    if n < 1:
+        return None
+    sim = np.asarray(rec.get("sim_time_s"), dtype=np.float64).ravel()
+    eff = np.asarray(rec.get("camera_on_effective"), dtype=np.float64).ravel()
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    world_w_m = float(cfg.nx) * float(cfg.resolution_m)
+    world_h_m = float(cfg.ny) * float(cfg.resolution_m)
+    poly_a = np.asarray(poly, dtype=np.float64)
+    wxy = np.column_stack([xs[:n], ys[:n]])
+    gxy = inverse_affine_world_to_graph(
+        wxy,
+        poly_a,
+        world_w_m=world_w_m,
+        world_h_m=world_h_m,
+        margin=1.0,
+    )
+    pts = [Point(float(gxy[k, 0]), float(gxy[k, 1])) for k in range(n)]
+    steps = np.arange(n, dtype=np.int32)
+    gdf = gpd.GeoDataFrame(
+        {"step": steps, "action": act[:n].copy()},
+        geometry=pts,
+        crs=str(crs),
+    ).to_crs(4326)
+    t_end = sim[:n].astype(np.float64) if sim.size >= n else np.full(n, np.nan, dtype=np.float64)
+    cam_e = eff[:n].astype(np.float64) if eff.size >= n else np.full(n, np.nan, dtype=np.float64)
+
+    fg = folium.FeatureGroup(name="Policy decisions (dot = each env step)", show=True)
+    for k in range(n):
+        row = gdf.iloc[k]
+        geom = row.geometry
+        lat, lon = float(geom.y), float(geom.x)
+        a = int(row["action"])
+        te = float(t_end[k]) if np.isfinite(t_end[k]) else float("nan")
+        ce = float(cam_e[k]) if np.isfinite(cam_e[k]) else -1.0
+        wanted_on = a == 1
+        actually_on = ce > 0.5
+        color = "#27ae60" if wanted_on else "#7f8c8d"
+        if ce >= 0.0 and wanted_on and not actually_on:
+            color = "#e67e22"
+        popup = f"step {k}, action={a}, cam_on_effective={ce:.0f}, sim_time_end_s≈{te:.1f}"
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=4,
+            color="#1c2833",
+            weight=1,
+            fill=True,
+            fillColor=color,
+            fillOpacity=0.85,
+            popup=folium.Popup(popup, max_width=240),
+        ).add_to(fg)
+    return fg
+
+
+def folium_feature_group_sim_env_grid(rec: dict[str, Any]) -> Any | None:
+    """
+    Folium layer: **simulation** grid lines (``cfg.nx`` × ``cfg.ny`` × ``resolution_m`` world metres),
+    same letterboxed frame as ``last_seen`` / greedy foot cell indexing, mapped through
+    ``inverse_affine_world_to_graph`` so they align with the OSM route map.
+
+    Requires ``polyline_graph_m`` and ``graph_crs`` (same as policy decision dots).
+    """
+    try:
+        import folium
+        import geopandas as gpd
+        from shapely.geometry import LineString
+    except ImportError:
+        return None
+
+    from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph
+
+    poly = rec.get("polyline_graph_m")
+    crs = rec.get("graph_crs")
+    if poly is None or crs is None:
+        return None
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    nx = int(cfg.nx)
+    ny = int(cfg.ny)
+    res = float(cfg.resolution_m)
+    world_w_m = float(nx) * res
+    world_h_m = float(ny) * res
+    poly_a = np.asarray(poly, dtype=np.float64)
+
+    lines_w: list[np.ndarray] = []
+    for j in range(nx + 1):
+        x = float(j) * res
+        lines_w.append(np.array([[x, 0.0], [x, world_h_m]], dtype=np.float64))
+    for i in range(ny + 1):
+        y = float(i) * res
+        lines_w.append(np.array([[0.0, y], [world_w_m, y]], dtype=np.float64))
+
+    fg = folium.FeatureGroup(
+        name=f"Sim grid ({nx}×{ny} @ {res:g} m — last_seen / greedy cells)",
+        show=False,
+    )
+    for wxy in lines_w:
+        gxy = inverse_affine_world_to_graph(
+            wxy,
+            poly_a,
+            world_w_m=world_w_m,
+            world_h_m=world_h_m,
+            margin=1.0,
+        )
+        ls = LineString(gxy)
+        gdf = gpd.GeoDataFrame(geometry=[ls], crs=str(crs)).to_crs(4326)
+        geom = gdf.geometry.iloc[0]
+        coords = [(float(lat), float(lon)) for lon, lat in geom.coords]
+        folium.PolyLine(
+            locations=coords,
+            color="#7b2cbf",
+            weight=1,
+            opacity=0.65,
+        ).add_to(fg)
+    return fg
+
+
+def _last_seen_stamp_folium_style(
+    ls: float,
+    *,
+    t_final: float,
+) -> dict[str, str | float]:
+    """
+    Fill style for one env cell from ``last_seen`` **stamp** (sim seconds), same semantics as map-age
+    raster: RdYlGn with later stamps greener; never scanned = neutral gray.
+    """
+    from matplotlib import colormaps
+
+    cmap = colormaps["RdYlGn"]
+    vmax = max(float(t_final), 1.0)
+    if not np.isfinite(ls) or float(ls) < -1e90:
+        return {
+            "fillColor": "#bdc3c7",
+            "fillOpacity": 0.22,
+            "color": "#7f8c8d",
+            "weight": 0.15,
+        }
+    u = float(np.clip((float(ls) - 0.0) / vmax, 0.0, 1.0))
+    r, g, b, _ = cmap(u)
+    hx = f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+    return {
+        "fillColor": hx,
+        "fillOpacity": 0.52,
+        "color": "#34495e",
+        "weight": 0.2,
+    }
+
+
+def folium_feature_group_env_last_seen_cells(rec: dict[str, Any]) -> Any | None:
+    """
+    Folium layer: each **env raster cell** as a filled polygon in map coordinates, colored by
+    ``rec["last_seen"][iy, ix]`` **stamp time** (sim s) at episode end — same red→yellow→green idea
+    as the map-age overlay (newer scan → greener). Never-scanned cells are light gray.
+
+    Uses the same world→graph affine as the route. Requires ``last_seen`` in ``rec``,
+    ``polyline_graph_m``, and ``graph_crs``.
+    """
+    try:
+        import folium
+        import geopandas as gpd
+        from shapely.geometry import Polygon, mapping
+    except ImportError:
+        return None
+
+    from adaptive_scanning.street_trajectories import inverse_affine_world_to_graph
+
+    poly = rec.get("polyline_graph_m")
+    crs = rec.get("graph_crs")
+    ls_arr = rec.get("last_seen")
+    if poly is None or crs is None or ls_arr is None:
+        return None
+    last_seen = np.asarray(ls_arr, dtype=np.float64)
+    if last_seen.ndim != 2:
+        return None
+    cfg: AdaptiveScanningConfig = rec["cfg"]
+    nx = int(cfg.nx)
+    ny = int(cfg.ny)
+    res = float(cfg.resolution_m)
+    if last_seen.shape[0] != ny or last_seen.shape[1] != nx:
+        return None
+    world_w_m = float(nx) * res
+    world_h_m = float(ny) * res
+    poly_a = np.asarray(poly, dtype=np.float64)
+    t_final = float(rec.get("final_sim_time_s", 0.0))
+
+    features: list[dict[str, Any]] = []
+    for iy in range(ny):
+        for ix in range(nx):
+            x0, x1 = float(ix) * res, float(ix + 1) * res
+            y0, y1 = float(iy) * res, float(iy + 1) * res
+            wxy = np.array(
+                [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]],
+                dtype=np.float64,
+            )
+            gxy = inverse_affine_world_to_graph(
+                wxy,
+                poly_a,
+                world_w_m=world_w_m,
+                world_h_m=world_h_m,
+                margin=1.0,
+            )
+            ga = np.asarray(gxy, dtype=np.float64)
+            poly_g = Polygon([(float(ga[i, 0]), float(ga[i, 1])) for i in range(int(ga.shape[0]))])
+            if not poly_g.is_valid:
+                poly_g = poly_g.buffer(0)
+            if poly_g.is_empty:
+                continue
+            gdf1 = gpd.GeoDataFrame(geometry=[poly_g], crs=str(crs)).to_crs(4326)
+            geom4326 = gdf1.geometry.iloc[0]
+            ls = float(last_seen[iy, ix])
+            st = _last_seen_stamp_folium_style(ls, t_final=t_final)
+            age_v = float(t_final - ls) if np.isfinite(ls) and ls > -1e90 else float("nan")
+            ls_prop = (
+                f"{float(ls):.2f}"
+                if np.isfinite(ls) and float(ls) > -1e90
+                else "never"
+            )
+            age_prop = f"{age_v:.2f}" if np.isfinite(age_v) else "—"
+            feat: dict[str, Any] = {
+                "type": "Feature",
+                "geometry": mapping(geom4326),
+                "properties": {
+                    "ix": ix,
+                    "iy": iy,
+                    "last_seen_s": ls_prop,
+                    "age_s": age_prop,
+                    "fillColor": st["fillColor"],
+                    "fillOpacity": st["fillOpacity"],
+                    "stroke": st["color"],
+                    "strokeWeight": st["weight"],
+                },
+            }
+            features.append(feat)
+
+    if not features:
+        return None
+    fc: dict[str, Any] = {"type": "FeatureCollection", "features": features}
+    fg = folium.FeatureGroup(
+        name=f"Env last_seen cells ({nx}×{ny}, stamp time RdYlGn @ t_end={t_final:.0f}s)",
+        show=False,
+    )
+
+    def _style(f: dict[str, Any]) -> dict[str, Any]:
+        p = f["properties"]
+        return {
+            "fillColor": p["fillColor"],
+            "fillOpacity": float(p["fillOpacity"]),
+            "color": p["stroke"],
+            "weight": float(p["strokeWeight"]),
+        }
+
+    folium.GeoJson(
+        data=fc,
+        style_function=_style,
+        tooltip=folium.GeoJsonTooltip(
+            fields=["ix", "iy", "last_seen_s", "age_s"],
+            aliases=["ix", "iy", "last_seen (sim s)", "age (s)"],
+            sticky=True,
+        ),
+    ).add_to(fg)
+    return fg
+
+
 def try_save_realworld_always_on_coverage(
     rec: dict[str, Any],
     base_image_path: str | Path,
@@ -2573,15 +2876,18 @@ def try_save_realworld_always_on_coverage(
       2) ``*_coverage_realworld_zoom.png`` — cropped around the route
       3) ``*_coverage_realworld_map.html`` — Folium (if ``folium`` installed): path,
          **always-on** coverage (green), **per-day** always-on wedges when multi-day playback,
-         **per-day policy** wedge unions when the camera is on (world path + same stride/radius as green),
+         **per-day policy** wedge unions when the camera is on (resampled route + stationary scans),
+         **policy decision dots** (one per env step at the agent position when the action was chosen),
+         optional **sim grid** (``nx``×``ny`` × ``resolution_m`` in world metres, layer off by default),
+         optional **env ``last_seen`` cells** (filled polygons colored by scan stamp, layer off by default),
          optional **map-age** raster (session-time red→green).
 
     **Coverage vs map age:** the green GeoJSON is motion-integrated **UTM** wedges along the
-    resampled OSM polyline (with ``stride`` when ``n_scan`` is large). **Policy** GeoJSON samples
-    ``rec["xs"], rec["ys"]`` (same as map-age), maps segment endpoints to **graph metres**, builds
-    wedges there with the same ``stride``, ``scan_radius_m``, and ``hfov_deg`` as green (so radius is
-    not inflated by world↔graph scale). Wedges only when ``camera_on_effective`` at sampled indices.
-    Map age is the **grid** ``last_scan`` heatmap from that same world path.
+    resampled OSM polyline (with ``stride`` when ``n_scan`` is large), in **graph CRS** — the same
+    geometry family as the route ``LineString(poly)`` drawn on the map. **Policy** wedges use the
+    same resampled walk plus optional stationary scan points from playback, with camera-on masks
+    aligned per-day via ``_policy_on_day_segments_from_playback`` when home-daily metadata exists.
+    Map age is the **grid** ``last_scan`` heatmap from ``rec["xs"], rec["ys"]`` (world path).
 
     Returns ``(full_png, zoom_png, html_or_none)`` or ``None`` if prerequisites missing.
     """
@@ -2599,10 +2905,7 @@ def try_save_realworld_always_on_coverage(
     except ImportError:
         return None
 
-    from adaptive_scanning.street_trajectories import (
-        inverse_affine_world_to_graph,
-        resample_polyline_at_speed,
-    )
+    from adaptive_scanning.street_trajectories import resample_polyline_at_speed
 
     cfg: AdaptiveScanningConfig = rec["cfg"]
     base_image_path = Path(base_image_path)
@@ -2757,25 +3060,28 @@ def try_save_realworld_always_on_coverage(
 
     debug_steps_csv = base_image_path.with_name(f"{base_image_path.stem}_policy_scan_debug_steps.csv")
     debug_segments_csv = base_image_path.with_name(f"{base_image_path.stem}_policy_scan_debug_segments.csv")
+    debug_stamps_txt = base_image_path.with_name(f"{base_image_path.stem}_coverage_realworld_map_stamps.txt")
     act_req = np.asarray(rec.get("action_requested"), dtype=np.int32).ravel()
     act_eff = np.asarray(rec.get("camera_on_effective"), dtype=np.float64).ravel()
+    move_eff = np.asarray(rec.get("step_interval_is_moving"), dtype=np.float64).ravel()
     budget_arr = np.asarray(rec.get("budget_s"), dtype=np.float64).ravel()
     sim_arr = np.asarray(rec.get("sim_time_s"), dtype=np.float64).ravel()
     step_day_idx = _segment_day_indices_playback(rec, int(sim_arr.size))
     if step_day_idx is None:
         step_day_idx = np.full(int(sim_arr.size), -1, dtype=np.int32)
     lines_steps = [
-        "env_step_idx,day_index,step_start_s,sim_time_end_s,action_requested,camera_on_effective,budget_s_after_step"
+        "env_step_idx,day_index,step_start_s,sim_time_end_s,step_interval_is_moving,action_requested,camera_on_effective,budget_s_after_step"
     ]
     for k in range(int(sim_arr.size)):
         day_k = int(step_day_idx[k]) if k < step_day_idx.size else -1
         step_start_k = float(sim_arr[k] - float(cfg.dt_s))
         sim_end_k = float(sim_arr[k])
+        moving_k = int(move_eff[k] > 0.5) if k < move_eff.size else 1
         act_req_k = int(act_req[k]) if k < act_req.size else -1
         act_eff_k = int(act_eff[k] > 0.5) if k < act_eff.size else 0
         bud_k = float(budget_arr[k]) if k < budget_arr.size else float("nan")
         lines_steps.append(
-            f"{k},{day_k},{step_start_k:.6f},{sim_end_k:.6f},{act_req_k},{act_eff_k},{bud_k:.6f}"
+            f"{k},{day_k},{step_start_k:.6f},{sim_end_k:.6f},{moving_k},{act_req_k},{act_eff_k},{bud_k:.6f}"
         )
     debug_steps_csv.write_text("\n".join(lines_steps) + "\n", encoding="utf-8")
 
@@ -2792,6 +3098,36 @@ def try_save_realworld_always_on_coverage(
             f"{k},{day_k},{stamp_k:.6f},{pol_on_k},{all_on_k}"
         )
     debug_segments_csv.write_text("\n".join(lines_segments) + "\n", encoding="utf-8")
+
+    day_counts: dict[int, int] = {}
+    for k in range(n_policy_seg):
+        if k >= on_policy_aug.size or not bool(on_policy_aug[k]):
+            continue
+        d = int(day_seg_policy[k]) if k < day_seg_policy.size else -1
+        day_counts[d] = int(day_counts.get(d, 0) + 1)
+    lines_txt = [
+        "status=OK",
+        "mode=policy_resampled_route_plus_stationary",
+        f"final_sim_time_s={float(rec.get('final_sim_time_s', 0.0))}",
+        f"dt_s={float(cfg.dt_s)}",
+        f"nseg={n_policy_seg}",
+        "note=Green/policy wedges use resampled graph polyline (same as map route); policy adds stationary scans from playback.",
+        "",
+        f"policy_on_steps={int(np.sum(on_policy_aug.astype(np.int32)))}",
+        f"policy_on_seconds={int(np.sum(on_policy_aug.astype(np.int32)) * int(round(float(cfg.dt_s))))}",
+        f"policy_on_by_day_steps={json.dumps({int(k): int(v) for k, v in sorted(day_counts.items())})}",
+        "",
+        "Per segment k: day_index, moving_mask(always_on), policy_on, stamp_start_s",
+    ]
+    for k in range(n_policy_seg):
+        day_k = int(day_seg_policy[k]) if k < day_seg_policy.size else -1
+        all_on_k = int(on_all[k]) if k < on_all.size else 0
+        pol_on_k = int(on_policy_aug[k]) if k < on_policy_aug.size else 0
+        st_k = float(stamps_policy_aug[k]) if k < stamps_policy_aug.size else float(k) * float(cfg.dt_s)
+        lines_txt.append(
+            f"k={k}\tday={day_k}\tmoving={all_on_k}\tpolicy_on={pol_on_k}\tstamp_sim_s={st_k:.6g}"
+        )
+    debug_stamps_txt.write_text("\n".join(lines_txt) + "\n", encoding="utf-8")
 
     mx0, my0, mx1, my1 = _map_extent_webmerc_from_cfg(cfg, gwm.geometry.iloc[0])
     zx0, zy0, zx1, zy1 = _route_zoom_bounds_3857(gwm, r_m)
@@ -2894,6 +3230,18 @@ def try_save_realworld_always_on_coverage(
             age_rgba, age_bounds, _n_hit_out = age_pack
         colored_paths = home_daily_colored_paths_3857(rec)
         extra_fg = folium_feature_groups_home_daily(rec)
+        dec_fg = folium_feature_group_policy_decisions(rec)
+        grid_fg = folium_feature_group_sim_env_grid(rec)
+        age_cells_fg = folium_feature_group_env_last_seen_cells(rec)
+        extra_for_html: list[Any] = []
+        if extra_fg:
+            extra_for_html.extend(extra_fg)
+        if dec_fg is not None:
+            extra_for_html.append(dec_fg)
+        if grid_fg is not None:
+            extra_for_html.append(grid_fg)
+        if age_cells_fg is not None:
+            extra_for_html.append(age_cells_fg)
         per_day_cov: list[tuple[str, str, Any]] = []
         for d in sorted(cov_by_day_graph.keys()):
             geom = cov_by_day_graph[d]
@@ -2901,7 +3249,7 @@ def try_save_realworld_always_on_coverage(
                 continue
             geom3857 = gpd.GeoDataFrame(geometry=[geom], crs=str(crs)).to_crs(3857).geometry.iloc[0]
             col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
-            per_day_cov.append((f"Coverage â€” always-on Day {d + 1}", col, geom3857))
+            per_day_cov.append((f"Coverage — always-on Day {d + 1}", col, geom3857))
         _policy_cov_graph, policy_by_day_graph, _policy_age_dup = _simulate_sector_walk_projected(
             x_path=xg_policy,
             y_path=yg_policy,
@@ -2919,7 +3267,7 @@ def try_save_realworld_always_on_coverage(
                 continue
             geom3857 = gpd.GeoDataFrame(geometry=[geom], crs=str(crs)).to_crs(3857).geometry.iloc[0]
             col = _HOME_DAILY_DAY_COLORS[d % len(_HOME_DAILY_DAY_COLORS)]
-            policy_cov_layers.append((f"Coverage â€” policy camera Day {d + 1}", col, geom3857))
+            policy_cov_layers.append((f"Coverage — policy camera Day {d + 1}", col, geom3857))
         html_done = save_realworld_folium_html(
             out_path=out_html,
             coverage_3857=cov_geom,
@@ -2928,11 +3276,13 @@ def try_save_realworld_always_on_coverage(
             age_bounds_wgs84=age_bounds,
             title=(
                 "Open layers: path, always-on wedge coverage (green + per-day when multi-day), "
-                "policy wedge coverage per day (camera on), map age heatmap. Scroll to zoom, drag to pan — "
+                "policy wedge coverage per day (camera on), **policy decision dots** (each env step), "
+                "**sim grid** + **env last_seen cells** (toggle in layer control), map age heatmap. "
+                "Scroll to zoom, drag to pan — "
                 + base_title
             ),
             colored_path_layers_3857=colored_paths,
-            extra_feature_groups=extra_fg,
+            extra_feature_groups=extra_for_html if extra_for_html else None,
             age_layer_name=age_layer_name,
             per_day_coverage_layers_3857=per_day_cov,
             policy_coverage_layers_3857=policy_cov_layers,
@@ -3174,15 +3524,27 @@ def try_save_realworld_day_prefix_coverage(
 
         colored_paths = home_daily_colored_paths_3857(rec)
         extra_fg = folium_feature_groups_home_daily(rec)
+        dec_fg2 = folium_feature_group_policy_decisions(rec)
+        grid_fg2 = folium_feature_group_sim_env_grid(rec)
+        age_cells_fg2 = folium_feature_group_env_last_seen_cells(rec)
+        extra_day: list[Any] = []
+        if extra_fg:
+            extra_day.extend(extra_fg)
+        if dec_fg2 is not None:
+            extra_day.append(dec_fg2)
+        if grid_fg2 is not None:
+            extra_day.append(grid_fg2)
+        if age_cells_fg2 is not None:
+            extra_day.append(age_cells_fg2)
         html_done = save_realworld_folium_html(
             out_path=out_html,
             coverage_3857=cov_geom,
             path_line_3857=path_geom,
             age_rgba=None,
             age_bounds_wgs84=None,
-            title="Open layers: path, coverage. " + base_title,
+            title="Open layers: path, coverage, policy decision dots. " + base_title,
             colored_path_layers_3857=colored_paths,
-            extra_feature_groups=extra_fg,
+            extra_feature_groups=extra_day if extra_day else None,
         )
         if html_done is not None:
             html_path = html_done
@@ -3591,6 +3953,7 @@ def policy_from_name(name: str, *, seed: int = 0) -> Policy:
         AlwaysOffPolicy,
         AlwaysOnPolicy,
         BudgetAwareGreedyPolicy,
+        BudgetAwareGreedyUnseenOnlyPolicy,
         GreedyLocalStalenessPolicy,
         RandomPolicy,
     )
@@ -3606,7 +3969,11 @@ def policy_from_name(name: str, *, seed: int = 0) -> Policy:
         return GreedyLocalStalenessPolicy()
     if name == "greedy_budget":
         return BudgetAwareGreedyPolicy()
-    raise ValueError(f"unknown policy name: {name!r} (try random, always_on, always_off, greedy_stale, greedy_budget)")
+    if name == "greedy_unseen":
+        return BudgetAwareGreedyUnseenOnlyPolicy()
+    raise ValueError(
+        f"unknown policy name: {name!r} (try random, always_on, always_off, greedy_stale, greedy_budget, greedy_unseen)"
+    )
 
 
 def visualize_episode(

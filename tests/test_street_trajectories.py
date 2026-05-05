@@ -10,6 +10,7 @@ from adaptive_scanning.street_trajectories import (
     build_street_trajectory,
     inverse_affine_world_to_graph,
     resample_polyline_at_speed,
+    _schedule_home_day_positions,
 )
 
 
@@ -23,6 +24,33 @@ def _toy_street_graph() -> nx.MultiDiGraph:
         G.add_edge(i, i + 1, length=25.0)
         G.add_edge(i + 1, i, length=25.0)
     return G
+
+
+def test_schedule_home_day_travel_time_uses_graph_metres():
+    """Travel SI durations must use OSM/graph path length, not letterboxed world length."""
+    rng = np.random.default_rng(42)
+    xy_g = np.array([[0.0, 0.0], [3000.0, 0.0], [6000.0, 0.0]], dtype=np.float64)
+    xy_w = affine_map_points(xy_g, margin=1.0, world_w_m=128.0, world_h_m=128.0)
+    out = _schedule_home_day_positions(
+        xy_w,
+        xy_g,
+        [1],
+        n_transitions=50_000,
+        dt_s=1.0,
+        speed_m_s=1.5,
+        rng=rng,
+        day_index=0,
+        abs_day_start_s=0.0,
+    )
+    assert out is not None
+    _xs, _ys, _hs, evs = out
+    travel_dur = sum(
+        float(e["t_end_s"]) - float(e["t_start_s"]) for e in evs if str(e.get("phase")) == "travel"
+    )
+    expect = 6000.0 / 1.5
+    assert abs(travel_dur - expect) < 5.0, (travel_dur, expect)
+    arc_sum = sum(float(e["arc_length_m"]) for e in evs if str(e.get("phase")) == "travel")
+    assert abs(arc_sum - 6000.0) < 1.0
 
 
 def test_annotate_playback_si_timeline_moving_cumulative():

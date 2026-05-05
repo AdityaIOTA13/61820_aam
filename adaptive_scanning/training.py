@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from adaptive_scanning.config import AdaptiveScanningConfig
+from adaptive_scanning.config import AdaptiveScanningConfig, config_from_saved_dict
 from adaptive_scanning.env import CameraBudgetEnv
 from adaptive_scanning.rollout import eval_policy
 from adaptive_scanning.policies import Policy
@@ -165,6 +165,10 @@ def train_reinforce(
     show_progress: bool = True,
     log_dir: str | Path | None = None,
 ) -> tuple[MLPPolicy, TrainResult]:
+    """
+    REINFORCE on ``CameraBudgetEnv`` — same dynamics, sector geometry, and reward as
+    ``python -m adaptive_scanning.run_sim visualize`` for a matching ``AdaptiveScanningConfig``.
+    """
     torch.manual_seed(seed)
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     env = CameraBudgetEnv(cfg, seed=seed)
@@ -330,7 +334,7 @@ def load_policy(path: str, device: str | None = None) -> tuple[MLPPolicy, Adapti
         ckpt = torch.load(path, map_location=dev, weights_only=False)
     except TypeError:
         ckpt = torch.load(path, map_location=dev)
-    cfg = AdaptiveScanningConfig(**ckpt["cfg"])
+    cfg = config_from_saved_dict(ckpt["cfg"])
     env = CameraBudgetEnv(cfg)
     pol = MLPPolicy(env.observation_dim).to(dev)
     pol.load_state_dict(ckpt["state_dict"])

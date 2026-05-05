@@ -306,7 +306,8 @@ def _xyh_at_cumdist(
 
 
 def _schedule_home_day_positions(
-    route_xy: np.ndarray,
+    route_xy_world: np.ndarray,
+    route_xy_graph: np.ndarray,
     leg_end_vertex_idx: list[int],
     *,
     n_transitions: int,
@@ -320,25 +321,33 @@ def _schedule_home_day_positions(
     Morning at home, travel legs, >=1h dwell at each intermediate, return home, evening at home;
     sample positions every ``dt_s`` for ``n_transitions``+1 points spanning ``n_transitions*dt_s``.
 
+    ``route_xy_world`` is the letterboxed env path (metres in the simulation frame); ``route_xy_graph``
+    is the same polyline in **projected graph metres** (OSM CRS). Travel durations and ``arc_length_m``
+    use **graph** cumulative distance so ``walk_speed_m_s`` matches real-world route length; positions
+    are interpolated along ``route_xy_world`` so the agent matches the env grid.
+
     ``abs_day_start_s`` is simulation time at the first sample of this day (seconds from episode start).
     """
-    xy = np.asarray(route_xy, dtype=np.float64)
-    if xy.shape[0] < 2 or n_transitions < 1:
+    xy_w = np.asarray(route_xy_world, dtype=np.float64)
+    xy_g = np.asarray(route_xy_graph, dtype=np.float64)
+    if xy_w.shape[0] < 2 or xy_w.shape != xy_g.shape or n_transitions < 1:
         return None
-    cum = _polyline_cumdist(xy)
+    cum_w = _polyline_cumdist(xy_w)
+    cum_g = _polyline_cumdist(xy_g)
     T_sec = float(n_transitions) * float(dt_s)
     if T_sec < 30.0:
         return None
     spd = max(float(speed_m_s), 0.05)
 
     k = len(leg_end_vertex_idx)
-    break_d = [float(cum[int(i)]) for i in leg_end_vertex_idx]
+    break_d_g = [float(cum_g[int(i)]) for i in leg_end_vertex_idx]
+    break_d_w = [float(cum_w[int(i)]) for i in leg_end_vertex_idx]
     travel_lens: list[float] = []
     prev = 0.0
-    for bd in break_d:
+    for bd in break_d_g:
         travel_lens.append(max(bd - prev, 1e-6))
         prev = bd
-    travel_lens.append(max(float(cum[-1]) - prev, 1e-6))
+    travel_lens.append(max(float(cum_g[-1]) - prev, 1e-6))
     trav_t = [L / spd for L in travel_lens]
 
     morning_max = min(_HOME_COMMUTE_MORNING_WINDOW_MAX_S, 0.28 * T_sec)
@@ -397,7 +406,8 @@ def _schedule_home_day_positions(
         if t_leave + sum_trav + float(sum(dwells)) + max(evening_buf, 0.0) > T_sec + 1.0:
             continue
 
-        s_breaks = [0.0] + break_d + [float(cum[-1])]
+        s_breaks_w = [0.0] + break_d_w + [float(cum_w[-1])]
+        s_breaks_g = [0.0] + break_d_g + [float(cum_g[-1])]
 
         def add_ev(
             t0: float,
@@ -408,6 +418,7 @@ def _schedule_home_day_positions(
             stop_i: int | None = None,
             s0: float | None = None,
             s1: float | None = None,
+            arc_graph_m: float | None = None,
         ) -> None:
             phases.append(
                 {
@@ -421,7 +432,7 @@ def _schedule_home_day_positions(
                 }
             )
             sd0 = float(s0) if s0 is not None else 0.0
-            xa, ya, ha = _xyh_at_cumdist(xy, cum, sd0)
+            xa, ya, ha = _xyh_at_cumdist(xy_w, cum_w, sd0)
             ev_out: dict[str, Any] = {
                 "t_start_s": abs_day_start_s + t0,
                 "t_end_s": abs_day_start_s + t1,
@@ -433,9 +444,8 @@ def _schedule_home_day_positions(
                 "y_m": ya,
                 "heading_rad": ha,
             }
-            if phase == "travel" and s0 is not None and s1 is not None:
-                arc_m = abs(float(s1) - float(s0))
-                ev_out["arc_length_m"] = float(arc_m)
+            if phase == "travel" and arc_graph_m is not None:
+                ev_out["arc_length_m"] = float(arc_graph_m)
                 ev_out["travel_speed_m_s"] = float(spd)
             day_events.append(ev_out)
 
@@ -443,13 +453,24 @@ def _schedule_home_day_positions(
             add_ev(0.0, t_leave, "morning_home", s0=0.0, s1=0.0)
         t_cur = t_leave
         for leg_i in range(k + 1):
-            s0b = float(s_breaks[leg_i])
-            s1b = float(s_breaks[leg_i + 1])
+            s0b_w = float(s_breaks_w[leg_i])
+            s1b_w = float(s_breaks_w[leg_i + 1])
+            s0b_g = float(s_breaks_g[leg_i])
+            s1b_g = float(s_breaks_g[leg_i + 1])
             dur = trav_t[leg_i]
-            add_ev(t_cur, t_cur + dur, "travel", leg_i=leg_i, s0=s0b, s1=s1b)
+            arc_g = abs(s1b_g - s0b_g)
+            add_ev(
+                t_cur,
+                t_cur + dur,
+                "travel",
+                leg_i=leg_i,
+                s0=s0b_w,
+                s1=s1b_w,
+                arc_graph_m=arc_g,
+            )
             t_cur += dur
             if leg_i < k:
-                sd = float(break_d[leg_i])
+                sd = float(break_d_w[leg_i])
                 add_ev(t_cur, t_cur + dwells[leg_i], "dwell_stop", stop_i=leg_i, s0=sd, s1=sd)
                 t_cur += dwells[leg_i]
         if t_cur < T_sec - 1e-6:
@@ -475,12 +496,12 @@ def _schedule_home_day_positions(
             p = str(ph["phase"])
             if p in ("morning_home", "evening_home", "dwell_stop"):
                 sd = float(ph.get("s0") or 0.0)
-                return _xyh_at_cumdist(xy, cum, sd)
+                return _xyh_at_cumdist(xy_w, cum_w, sd)
             frac = (t_rel - t0) / max(t1 - t0, 1e-9)
             s0b = float(ph["s0"])
             s1b = float(ph["s1"])
-            return _xyh_at_cumdist(xy, cum, s0b + frac * (s1b - s0b))
-        return _xyh_at_cumdist(xy, cum, 0.0)
+            return _xyh_at_cumdist(xy_w, cum_w, s0b + frac * (s1b - s0b))
+        return _xyh_at_cumdist(xy_w, cum_w, 0.0)
 
     for j in range(n_out + 1):
         t_rel = min(float(j) * float(dt_s), T_sec)
@@ -509,15 +530,22 @@ def _sample_one_day_home_chain_graph(
     nd: np.ndarray,
     *,
     prior_destination_nodes: list[Any] | None = None,
+    prior_stops_with_day: list[tuple[Any, int]] | None = None,
     repeat_destination_p: float = 0.0,
+    repeat_prior_stops_recency: float = 1.0,
+    current_day_index: int = 0,
     max_attempts: int = 200,
 ) -> tuple[np.ndarray, dict[str, Any]] | None:
     """
     ``walks_per_day`` legs: home → … → home using ``walks_per_day - 1`` intermediate nodes.
 
-    With probability ``repeat_destination_p`` (and non-empty ``prior_destination_nodes``), each new
-    stop prefers a **distinct** node drawn from prior days' destinations; otherwise it is random on
-    the graph (excluding home and stops already placed today).
+    With probability ``repeat_destination_p`` (and non-empty prior stops), each new stop prefers a
+    **distinct** node drawn from prior days' destinations; otherwise it is random on the graph
+    (excluding home and stops already placed today).
+
+    When ``prior_stops_with_day`` is set, reuse weights favor recent days if
+    ``repeat_prior_stops_recency < 1`` (see ``AdaptiveScanningConfig.osm_repeat_prior_stops_recency``).
+    If unset, ``prior_destination_nodes`` is used with uniform choice among unique prior nodes.
 
     Returns polyline (N, 2) in graph projected metres plus ``stop_xy_m`` and ``stop_node_ids``.
     """
@@ -527,8 +555,37 @@ def _sample_one_day_home_chain_graph(
     if len(pool) < k:
         return None
     p_rep = float(np.clip(float(repeat_destination_p), 0.0, 1.0))
-    prior_unique = list(dict.fromkeys(prior_destination_nodes or []))
-    prior_unique = [n for n in prior_unique if n != home]
+    rec_w = float(np.clip(float(repeat_prior_stops_recency), 0.0, 1.0))
+    d_cur = int(current_day_index)
+
+    prior_last_day: dict[Any, int] = {}
+    if prior_stops_with_day:
+        for n, d0 in prior_stops_with_day:
+            if n == home:
+                continue
+            d0i = int(d0)
+            if d0i < d_cur:
+                prior_last_day[n] = max(prior_last_day.get(n, -1), d0i)
+        prior_unique = list(prior_last_day.keys())
+    else:
+        prior_unique = list(dict.fromkeys(prior_destination_nodes or []))
+        prior_unique = [n for n in prior_unique if n != home]
+        # No calendar day metadata: treat all prior stops as maximally recent so weights stay uniform.
+        prior_last_day = {n: max(0, d_cur - 1) for n in prior_unique}
+
+    def _pick_prior_node(cands: list[Any]) -> Any:
+        arr = np.array(cands, dtype=object)
+        if arr.size == 1 or rec_w >= 1.0 - 1e-12 or d_cur <= 0:
+            return rng.choice(arr)
+        ws = np.empty(arr.size, dtype=np.float64)
+        for ii, n in enumerate(cands):
+            lag = max(0, d_cur - 1 - int(prior_last_day[n]))
+            ws[ii] = float(rec_w) ** int(lag)
+        s = float(ws.sum())
+        if s <= 0.0 or not np.isfinite(s):
+            return rng.choice(arr)
+        return rng.choice(arr, p=ws / s)
+
     for _ in range(max_attempts):
         if k <= 0:
             return None
@@ -543,7 +600,7 @@ def _sample_one_day_home_chain_graph(
                 if use_prior:
                     cands = [n for n in prior_unique if n not in blocked]
                     if cands:
-                        cand = rng.choice(np.array(cands, dtype=object))
+                        cand = _pick_prior_node(cands)
                 if cand is None:
                     cands2 = [x for x in pool if x not in blocked]
                     if not cands2:
@@ -606,6 +663,7 @@ def build_home_daily_episode_trajectory(
     walks_per_day: int,
     same_home_next_day_p: float,
     repeat_destination_across_days_p: float = 0.35,
+    repeat_prior_stops_recency: float = 1.0,
     margin_m: float = 1.0,
     outer_retry: int = 300,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]] | None:
@@ -614,6 +672,8 @@ def build_home_daily_episode_trajectory(
     Walk *i+1* begins at the graph node where walk *i* ended. One **home** graph node is chosen for the
     whole episode; every day returns there. From day 2 onward, each intermediate stop reuses a node
     visited as a destination on an earlier day with probability ``repeat_destination_across_days_p``.
+    When reusing, ``repeat_prior_stops_recency`` (< 1) down-weights older days so corridors do not all
+    line up on the same long-lag pairs (e.g. day 1 vs day 3). ``1.0`` recovers uniform prior reuse.
     (``same_home_next_day_p`` is kept on the API for compatibility but is not used.)
 
     Returns ``(x, y, h, polyline_graph_m, plot_meta)`` where ``plot_meta`` has ``home_xy_m`` (graph metres),
@@ -621,6 +681,7 @@ def build_home_daily_episode_trajectory(
     """
     _ = float(np.clip(float(same_home_next_day_p), 0.0, 1.0))  # unused; retained for call compatibility
     p_repeat = float(np.clip(float(repeat_destination_across_days_p), 0.0, 1.0))
+    p_rec = float(np.clip(float(repeat_prior_stops_recency), 0.0, 1.0))
     wpd = max(2, int(walks_per_day))
     n_steps = int(max_sim_time_s / float(dt_s))
     if n_steps < 1:
@@ -639,7 +700,7 @@ def build_home_daily_episode_trajectory(
         days_plot_meta = []
         home = rng.choice(nd)
         failed = False
-        prior_stop_nodes: list[Any] = []
+        prior_stops_day: list[tuple[Any, int]] = []
         for d in range(len(day_trans)):
             got = _sample_one_day_home_chain_graph(
                 G,
@@ -647,8 +708,10 @@ def build_home_daily_episode_trajectory(
                 home,
                 wpd,
                 nd,
-                prior_destination_nodes=prior_stop_nodes if prior_stop_nodes else None,
+                prior_stops_with_day=prior_stops_day if prior_stops_day else None,
                 repeat_destination_p=p_repeat if d > 0 else 0.0,
+                repeat_prior_stops_recency=p_rec,
+                current_day_index=int(d),
             )
             if got is None:
                 failed = True
@@ -661,7 +724,7 @@ def build_home_daily_episode_trajectory(
             days_plot_meta.append(meta_day)
             daily_graph.append(route)
             for sid in meta_day.get("stop_node_ids", ()):
-                prior_stop_nodes.append(sid)
+                prior_stops_day.append((sid, int(d)))
         if not failed and daily_graph is not None:
             break
         daily_graph = None
@@ -690,6 +753,7 @@ def build_home_daily_episode_trajectory(
         T_sec = float(T) * float(dt_s)
         sch = _schedule_home_day_positions(
             daily_world[i],
+            daily_graph[i],
             leg_idx,
             n_transitions=int(T),
             dt_s=float(dt_s),
@@ -782,6 +846,7 @@ def try_build_home_daily_episode_trajectory(
     walks_per_day: int,
     same_home_next_day_p: float,
     repeat_destination_across_days_p: float,
+    repeat_prior_stops_recency: float = 1.0,
     network_type: str = "walk",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, dict[str, Any]] | None:
     try:
@@ -804,6 +869,7 @@ def try_build_home_daily_episode_trajectory(
             walks_per_day=walks_per_day,
             same_home_next_day_p=same_home_next_day_p,
             repeat_destination_across_days_p=repeat_destination_across_days_p,
+            repeat_prior_stops_recency=float(repeat_prior_stops_recency),
         )
         if out is None:
             return None
