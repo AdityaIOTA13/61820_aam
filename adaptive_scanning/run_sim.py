@@ -11,8 +11,8 @@ CLI for adaptive scanning simulation.
   python -m adaptive_scanning.run_sim visualize --fast --one-path --out outputs/adaptive_scanning/osm_one_leg.png
   python -m adaptive_scanning.run_sim four-paths --place "Cambridge, Massachusetts, USA" --seed 2 --out outputs/adaptive_scanning/four_paths_example
   python -m adaptive_scanning.run_sim visualize --fast --one-path --mit-campus --out outputs/adaptive_scanning/mit.png
-  python -m adaptive_scanning.run_sim visualize --streets --mit-campus --home-commute --walks-per-day 3 --days 4 --same-home-p 0.6 --skip-episode-png --out outputs/adaptive_scanning/home_round
-  python -m adaptive_scanning.run_sim export --streets --mit-campus --home-commute --walks-per-day 3 --days 4 --n-episodes 8 --out outputs/adaptive_scanning/home_commute_batch.npz
+  python -m adaptive_scanning.run_sim visualize --streets --mit-campus --home-commute --walks-per-day 3 --days 6 --same-home-p 0.6 --skip-episode-png --out outputs/adaptive_scanning/home_round
+  python -m adaptive_scanning.run_sim export --streets --mit-campus --home-commute --walks-per-day 3 --days 6 --n-episodes 8 --out outputs/adaptive_scanning/home_commute_batch.npz
   python -m adaptive_scanning.run_sim visualize --policy greedy_budget --skip-episode-png --video-budget-minutes-per-day 3 --coverage-first-minutes-per-day 3 --out outputs/adaptive_scanning/day_prefix_demo.png
   # Default OSM area when --streets/--one-path with no --place/--bbox: Cambridge, MA (see street_trajectories.DEFAULT_OSM_PLACE)
 """

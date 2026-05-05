@@ -52,7 +52,7 @@ class AdaptiveScanningConfig:
     video_budget_reference_walk_speed_m_s: float = 1.35
 
     # Episode length in simulated time (budget resets each day_duration_s within this span)
-    max_sim_time_s: float = 4 * 8 * 3600.0  # 4×8 h walking days (matches MIT home-commute demos)
+    max_sim_time_s: float = 6 * 8 * 3600.0  # 6×8 h walking days (MIT home-commute style demos)
 
     # Reward weights (negative reward = cost minimization in RL)
     w_uncovered: float = 1.0
