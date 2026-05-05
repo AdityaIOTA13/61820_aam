@@ -33,3 +33,8 @@ cache/
 # Large raw data (hosted on R2 CDN instead)
 data/equirectangular export insta360/
 data/video_cache.mp4
+# colmap_input — commit only small metadata, exclude large binaries
+outputs/colmap_input/*/database.db
+outputs/colmap_input/*/sparse/
+outputs/colmap_input/*/images/
+outputs/colmap_input/*/sparse_pointcloud.ply
