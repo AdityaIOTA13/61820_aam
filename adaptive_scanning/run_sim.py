@@ -231,6 +231,20 @@ def main(argv: list[str] | None = None) -> None:
         "(subtract W × leftover_fraction). Omit to use AdaptiveScanningConfig.w_unused_budget_end_of_day.",
     )
     pt.add_argument(
+        "--w-stale-scanned",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Override AdaptiveScanningConfig.w_stale_scanned reward weight (penalty on stale scanned cells).",
+    )
+    pt.add_argument(
+        "--w-uncovered",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Override AdaptiveScanningConfig.w_uncovered reward weight (penalty on never-scanned cells).",
+    )
+    pt.add_argument(
         "--no-evening-leniency",
         action="store_true",
         help="Disable greedy-unseen evening relax (evening_lenient_after_s_since_day_start=-1).",
@@ -446,6 +460,12 @@ def main(argv: list[str] | None = None) -> None:
         ubp = getattr(args, "unused_budget_penalty", None)
         if ubp is not None:
             cfg.w_unused_budget_end_of_day = float(ubp)
+        wss = getattr(args, "w_stale_scanned", None)
+        if wss is not None:
+            cfg.w_stale_scanned = float(wss)
+        wu = getattr(args, "w_uncovered", None)
+        if wu is not None:
+            cfg.w_uncovered = float(wu)
 
         if bool(getattr(args, "no_evening_leniency", False)):
             cfg.evening_lenient_after_s_since_day_start = -1.0
