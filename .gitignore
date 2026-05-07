@@ -41,3 +41,9 @@ outputs/colmap_input/*/sparse_pointcloud.ply
 
 # data_02 large videos — hosted on R2
 data_02/insta360_export/*.mp4
+
+# data_02 pipeline outputs — large files (frames/depth on R2, not git)
+data_02_outputs/frames/
+data_02_outputs/depth_maps/
+data_02_outputs/raw_depths/
+data_02_outputs/video_cache/
