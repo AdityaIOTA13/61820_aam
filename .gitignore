@@ -38,3 +38,6 @@ outputs/colmap_input/*/database.db
 outputs/colmap_input/*/sparse/
 outputs/colmap_input/*/images/
 outputs/colmap_input/*/sparse_pointcloud.ply
+
+# data_02 large videos — hosted on R2
+data_02/insta360_export/*.mp4
