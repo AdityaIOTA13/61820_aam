@@ -1,0 +1,47 @@
+[
+  {
+    "strategy": "all_or_stride",
+    "label": "All frames baseline (stride 3)",
+    "selection": "outputs/frames/*.jpg with --stride 3",
+    "output_dir": "outputs/colmap_runs/all_or_stride",
+    "input_frames": 61,
+    "registered_images": 61,
+    "registration_percent": 100.0,
+    "sparse_points": 11541,
+    "mean_reprojection_error_px": 0.470058,
+    "ply_exported": true,
+    "ply_path": "outputs/colmap_runs/all_or_stride/reconstruction.ply",
+    "runtime_sec": 100.9,
+    "sparse_model_dir": "outputs/colmap_runs/all_or_stride/sparse/1"
+  },
+  {
+    "strategy": "budget36",
+    "label": "Budget-selected / masked frames",
+    "selection": "outputs/colmap_input/budget36/frame_manifest.json",
+    "output_dir": "outputs/colmap_runs/budget36",
+    "input_frames": 36,
+    "registered_images": 33,
+    "registration_percent": 91.67,
+    "sparse_points": 12576,
+    "mean_reprojection_error_px": 0.49391,
+    "ply_exported": true,
+    "ply_path": "outputs/colmap_runs/budget36/reconstruction.ply",
+    "runtime_sec": 66.97,
+    "sparse_model_dir": "outputs/colmap_runs/budget36/sparse/1"
+  },
+  {
+    "strategy": "random36",
+    "label": "Random baseline",
+    "selection": "outputs/colmap_runs/random36_selection.txt",
+    "output_dir": "outputs/colmap_runs/random36",
+    "input_frames": 36,
+    "registered_images": 23,
+    "registration_percent": 63.89,
+    "sparse_points": 6951,
+    "mean_reprojection_error_px": 0.430319,
+    "ply_exported": true,
+    "ply_path": "outputs/colmap_runs/random36/reconstruction.ply",
+    "runtime_sec": 71.12,
+    "sparse_model_dir": "outputs/colmap_runs/random36/sparse/1"
+  }
+]
