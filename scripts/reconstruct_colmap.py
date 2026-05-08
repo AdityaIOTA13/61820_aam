@@ -95,6 +95,35 @@ def heading_from_positions(positions: dict[str, dict], ordered_names: list[str],
 
 
 def load_selection(path: Path) -> list[str]:
+    if path.suffix.lower() == ".json":
+        with open(path) as f:
+            data = json.load(f)
+        values: list[str] = []
+
+        def collect(node: object) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    collect(item)
+            elif isinstance(node, dict):
+                for key in ("filename", "source_frame", "frame", "frame_name", "image", "image_name"):
+                    value = node.get(key)
+                    if isinstance(value, str):
+                        values.append(value)
+                frames = node.get("frames")
+                if isinstance(frames, dict):
+                    values.extend(str(name) for name in frames.keys())
+                elif isinstance(frames, list):
+                    collect(frames)
+                for key in ("selected_frames", "selected_frame_names", "selected"):
+                    selected = node.get(key)
+                    if isinstance(selected, list):
+                        collect(selected)
+            elif isinstance(node, str):
+                values.append(node)
+
+        collect(data)
+        return list(dict.fromkeys(values))
+
     values: list[str] = []
     with open(path) as f:
         for line in f:
