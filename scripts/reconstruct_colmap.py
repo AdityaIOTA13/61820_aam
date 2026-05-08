@@ -249,11 +249,15 @@ def prepare_output(out_dir: Path, overwrite: bool) -> tuple[Path, Path, Path, Pa
     return images_dir, sparse_dir, db_path, ply_path
 
 
+def repo_path(path: Path) -> Path:
+    return path if path.is_absolute() else ROOT / path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reconstruct sparse 3D geometry from 360 frames with COLMAP.")
     parser.add_argument("--frames-dir", type=Path, default=DEFAULT_FRAMES_DIR)
     parser.add_argument("--positions-json", type=Path, default=DEFAULT_POSITIONS_JSON)
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument("--out-dir", "--output-dir", dest="out_dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--selection-list", type=Path, help="Text file of selected frame filenames, stems, or timestamps.")
     parser.add_argument("--max-frames", type=int, help="Use only the first N selected/available frames.")
     parser.add_argument("--stride", type=int, default=1, help="Use every Nth selected/available frame.")
@@ -266,6 +270,12 @@ def main() -> None:
     parser.add_argument("--skip-colmap", action="store_true", help="Only generate perspective crops and manifest.")
     parser.add_argument("--overwrite", action="store_true", help="Delete the output directory before running.")
     args = parser.parse_args()
+
+    args.frames_dir = repo_path(args.frames_dir)
+    args.positions_json = repo_path(args.positions_json)
+    args.out_dir = repo_path(args.out_dir)
+    if args.selection_list is not None:
+        args.selection_list = repo_path(args.selection_list)
 
     positions = load_positions(args.positions_json)
     selected = select_frames(args.frames_dir, positions, args.selection_list, args.max_frames, args.stride)
