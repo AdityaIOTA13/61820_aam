@@ -43,6 +43,7 @@ All scripts are run from the repo root and use paths relative to it automaticall
 | `scripts/estimate_depth.py` | Runs Depth Anything V2 Small on all frames → grayscale depth PNGs |
 | `scripts/generate_images.py` | Regenerates the floorplan grid/walkpath PNGs |
 | `scripts/generate_pointcloud.py` | Builds a metric RGB point cloud from depth maps + frame positions |
+| `scripts/reconstruct_colmap.py` | Converts 360° frames to perspective crops and runs COLMAP sparse SfM |
 | `scripts/courtyard_geom.py` | Shared equirectangular depth scaling + ground-plane rays (used by point cloud + coverage) |
 | `scripts/project_coverage.py` | Projects depth onto z=0, accumulates **last observation time** per grid cell → map-age PNGs |
 | `scripts/fetch_sample_frames.py` | Downloads first N frames + depth from R2 for quick local tests |
@@ -186,49 +187,64 @@ python scripts/simulate_revisit_days.py --reset-coverage --json-out outputs/revi
 
 ## 3D Reconstruction (COLMAP)
 
-`scripts/prepare_colmap.py` selects frames via a greedy staleness policy and crops a forward-facing perspective patch (100° HFOV, 1280×720) from each equirectangular frame, then prints ready-to-run COLMAP commands.
+Monocular depth maps were a quick proxy for geometry. The SfM path below is the COLMAP alternative: it estimates real camera poses and sparse 3D points from the extracted 360° video frames after converting each equirectangular image into a forward-facing perspective crop.
+
+Install COLMAP:
 
 ```bash
-# Select 36 frames via greedy budget policy, crop perspective patches, print COLMAP commands
-python scripts/prepare_colmap.py --budget 36
+# macOS
+brew install colmap
 
-# Or use all 183 frames (always-on baseline)
-python scripts/prepare_colmap.py --all
+# Ubuntu/Debian
+sudo apt-get install colmap
 ```
 
-**Run COLMAP** (requires `colmap` — `brew install colmap` on macOS):
+Run the demo-ready reconstruction pipeline:
 
 ```bash
-colmap feature_extractor \
-    --database_path outputs/colmap_input/budget36/database.db \
-    --image_path outputs/colmap_input/budget36/images/ \
-    --ImageReader.camera_model PINHOLE --ImageReader.single_camera 1
+# Quick local smoke test on the first 20 frames
+python scripts/reconstruct_colmap.py --max-frames 20 --overwrite
 
-colmap exhaustive_matcher --database_path outputs/colmap_input/budget36/database.db
+# Run all extracted frames from outputs/frames/
+python scripts/reconstruct_colmap.py --overwrite
 
-mkdir -p outputs/colmap_input/budget36/sparse
-colmap mapper \
-    --database_path outputs/colmap_input/budget36/database.db \
-    --image_path outputs/colmap_input/budget36/images/ \
-    --output_path outputs/colmap_input/budget36/sparse/
+# Reconstruct a selected subset. Each line can be a frame filename,
+# frame stem, or timestamp in seconds.
+python scripts/reconstruct_colmap.py --selection-list selected_frames.txt --overwrite
 ```
 
-**Pre-run result (budget36):** 33/36 frames registered, **10,998 3D points**, mean reprojection error **0.84 px**.
+What the script does:
+- Reads equirectangular JPEGs from `outputs/frames/`
+- Uses `outputs/frame_positions.json` headings when available
+- Crops each 360° frame to a 100° HFOV, 1280×720 PINHOLE image approximating the Meta Ray-Ban forward field of view
+- Writes crops to `outputs/colmap/images/`
+- Runs `colmap feature_extractor`, `sequential_matcher`, `mapper`, and `model_converter`
+- Writes sparse reconstruction files under `outputs/colmap/sparse/`
+- Exports the sparse point cloud to `outputs/colmap/reconstruction.ply`
+- Logs COLMAP output to `outputs/colmap/colmap_run.log`
 
-**View in COLMAP GUI** (after running mapper):
+The script defaults to CPU SIFT (`--SiftExtraction.use_gpu 0`, `--SiftMatching.use_gpu 0`) because the local GPU feature extractor crashed during testing. Use `--use-gpu` if your COLMAP install is stable with GPU SIFT.
+
+Verified local smoke test:
+
+```bash
+python scripts/reconstruct_colmap.py --max-frames 20 --overwrite
+```
+
+This completed locally and exported `outputs/colmap/reconstruction.ply`. COLMAP produced a main sparse component with 20/20 registered images, 8,789 3D points, and 0.436 px mean reprojection error.
+
+View the result in the COLMAP GUI using the sparse model path printed by the script. For the verified 20-frame run:
+
 ```bash
 colmap gui \
-    --import_path outputs/colmap_input/budget36/sparse/0/ \
-    --database_path outputs/colmap_input/budget36/database.db \
-    --image_path outputs/colmap_input/budget36/images/
+    --import_path outputs/colmap/sparse/1/ \
+    --database_path outputs/colmap/database.db \
+    --image_path outputs/colmap/images/
 ```
 
-**Download sparse PLY** (open in MeshLab / CloudCompare / Blender):
-```
-https://assets02.aitkena.com/courtyard_360/colmap_sparse_budget36.ply
-```
+`outputs/colmap/` is gitignored so databases, crops, sparse models, and PLY files do not get committed.
 
-See `outputs/colmap_input/budget36/reconstruction_preview.png` for a top-down + side static preview.
+`scripts/prepare_colmap.py` is still available for the older greedy-budget crop-preparation workflow that prints manual COLMAP commands.
 
 ---
 
