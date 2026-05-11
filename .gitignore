@@ -34,7 +34,22 @@ cache/
 data/equirectangular export insta360/
 data/video_cache.mp4
 # colmap_input — commit only small metadata, exclude large binaries
+outputs/
 outputs/colmap_input/*/database.db
 outputs/colmap_input/*/sparse/
 outputs/colmap_input/*/images/
 outputs/colmap_input/*/sparse_pointcloud.ply
+outputs/colmap/
+outputs/colmap_runs/**
+!outputs/colmap_runs/
+!outputs/colmap_runs/summary.json
+!outputs/colmap_runs/summary.md
+
+# data_02 large videos — hosted on R2
+data_02/insta360_export/*.mp4
+
+# data_02 pipeline outputs — large files (frames/depth on R2, not git)
+data_02_outputs/frames/
+data_02_outputs/depth_maps/
+data_02_outputs/raw_depths/
+data_02_outputs/video_cache/

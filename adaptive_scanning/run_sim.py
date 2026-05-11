@@ -2,16 +2,18 @@
 CLI for adaptive scanning simulation.
 
   python -m adaptive_scanning.run_sim eval
+  python -m adaptive_scanning.run_sim coverage-eval --streets --place "Cambridge, Massachusetts, USA" --n-scenarios 8 --checkpoint models/policy-coverage.pt --out outputs/eval_coverage.json
   python -m adaptive_scanning.run_sim train --epochs 30 --out models/policy.pt
   # With --out, also writes models/policy_training/{config.json,metrics.jsonl,history.json,training_curves.png}
   # Override: --train-log-dir PATH | disable: --no-train-log
+  # Evening greedy-unseen: --evening-leniency-after-s SEC | --evening-leniency-ramp-s SEC | --no-evening-leniency | …
   python -m adaptive_scanning.run_sim export --out outputs/adaptive_scanning/episodes.npz
   python -m adaptive_scanning.run_sim visualize --fast --policy random --out outputs/adaptive_scanning/preview.png
   python -m adaptive_scanning.run_sim visualize --fast --one-path --out outputs/adaptive_scanning/osm_one_leg.png
   python -m adaptive_scanning.run_sim four-paths --place "Cambridge, Massachusetts, USA" --seed 2 --out outputs/adaptive_scanning/four_paths_example
   python -m adaptive_scanning.run_sim visualize --fast --one-path --mit-campus --out outputs/adaptive_scanning/mit.png
-  python -m adaptive_scanning.run_sim visualize --streets --mit-campus --home-commute --walks-per-day 3 --days 4 --same-home-p 0.6 --skip-episode-png --out outputs/adaptive_scanning/home_round
-  python -m adaptive_scanning.run_sim export --streets --mit-campus --home-commute --walks-per-day 3 --days 4 --n-episodes 8 --out outputs/adaptive_scanning/home_commute_batch.npz
+  python -m adaptive_scanning.run_sim visualize --streets --mit-campus --home-commute --walks-per-day 3 --days 6 --same-home-p 0.6 --skip-episode-png --out outputs/adaptive_scanning/home_round
+  python -m adaptive_scanning.run_sim export --streets --mit-campus --home-commute --walks-per-day 3 --days 6 --n-episodes 8 --out outputs/adaptive_scanning/home_commute_batch.npz
   python -m adaptive_scanning.run_sim visualize --policy greedy_budget --skip-episode-png --video-budget-minutes-per-day 3 --coverage-first-minutes-per-day 3 --out outputs/adaptive_scanning/day_prefix_demo.png
   # Default OSM area when --streets/--one-path with no --place/--bbox: Cambridge, MA (see street_trajectories.DEFAULT_OSM_PLACE)
 """
@@ -100,6 +102,14 @@ def _add_home_commute_cli_args(sub: argparse.ArgumentParser) -> None:
         default=0.35,
         help="With --home-commute: per intermediate stop, prob. of reusing a prior day's destination (else new node)",
     )
+    sub.add_argument(
+        "--repeat-prior-recency",
+        type=float,
+        default=None,
+        help="With --home-commute: when reusing a prior stop, weight ~ this^(days since that stop). "
+        "1.0 = uniform over all prior days; lower values favor yesterday (less long-gap overlap). "
+        "Omit to keep AdaptiveScanningConfig.osm_repeat_prior_stops_recency (default 0.55).",
+    )
 
 
 def _apply_home_commute_cli(cfg: "AdaptiveScanningConfig", args: argparse.Namespace) -> None:
@@ -114,6 +124,8 @@ def _apply_home_commute_cli(cfg: "AdaptiveScanningConfig", args: argparse.Namesp
     cfg.osm_repeat_destination_across_days_p = float(
         getattr(args, "repeat_destination_p", 0.35)
     )
+    if getattr(args, "repeat_prior_recency", None) is not None:
+        cfg.osm_repeat_prior_stops_recency = float(args.repeat_prior_recency)
     ndays = int(getattr(args, "days", 0))
     if ndays > 0:
         cfg.max_sim_time_s = float(ndays) * float(cfg.day_duration_s)
@@ -164,7 +176,7 @@ def _fast_cfg() -> "AdaptiveScanningConfig":
         resolution_m=2.0,
         max_sim_time_s=2 * 3600.0,
         day_duration_s=3600.0,
-        seconds_video_budget_per_day=150.0,  # half of default 5 min/day for fast smoke runs
+        seconds_video_budget_per_day=150.0,  # reduced budget for fast smoke runs
         dt_s=5.0,
         patch_cells=15,
         motion_mode="box",
@@ -193,6 +205,35 @@ def main(argv: list[str] | None = None) -> None:
     _add_street_cli_args(pe)
     _add_home_commute_cli_args(pe)
 
+    pce = sub.add_parser(
+        "coverage-eval",
+        help="N-scenario benchmark: trained / random / greedy unseen / greedy unseen+late rescan / oracle",
+    )
+    pce.add_argument("--fast", action="store_true", help="Small grid / short episode for smoke tests")
+    pce.add_argument("--n-scenarios", type=int, default=8, dest="n_scenarios")
+    pce.add_argument("--seed", type=int, default=0)
+    pce.add_argument(
+        "--checkpoint",
+        type=str,
+        default="",
+        help="Path to policy .pt (MLP). If set, all methods use the checkpoint's saved config.",
+    )
+    pce.add_argument(
+        "--out",
+        type=str,
+        default="",
+        help="Write JSON summary to this path (optional)",
+    )
+    pce.add_argument("--device", type=str, default="", help="torch device for MLP, e.g. cuda or cpu")
+    pce.add_argument(
+        "--oracle-global-budget",
+        action="store_true",
+        help="Oracle: use a single global pool of D×R ON steps (may exceed R on one day; "
+        "replay can clamp). Default is per-day feasible (≤ R per calendar day), matching the env.",
+    )
+    _add_street_cli_args(pce)
+    _add_home_commute_cli_args(pce)
+
     pt = sub.add_parser("train", help="Train REINFORCE MLP policy")
     pt.add_argument("--fast", action="store_true", help="Small grid / short horizon for smoke tests")
     pt.add_argument("--epochs", type=int, default=40)
@@ -219,12 +260,74 @@ def main(argv: list[str] | None = None) -> None:
         help="Weight on unused fraction of daily camera budget applied at each simulated day boundary "
         "(subtract W × leftover_fraction). Omit to use AdaptiveScanningConfig.w_unused_budget_end_of_day.",
     )
+    pt.add_argument(
+        "--w-stale-scanned",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Override AdaptiveScanningConfig.w_stale_scanned reward weight (penalty on stale scanned cells).",
+    )
+    pt.add_argument(
+        "--w-uncovered",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Override AdaptiveScanningConfig.w_uncovered reward weight (penalty on never-scanned cells).",
+    )
+    pt.add_argument(
+        "--no-evening-leniency",
+        action="store_true",
+        help="Disable greedy-unseen evening relax (evening_lenient_after_s_since_day_start=-1).",
+    )
+    pt.add_argument(
+        "--evening-leniency-after-s",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Override evening_lenient_after_s_since_day_start (seconds since simulated day start; <0 disables).",
+    )
+    pt.add_argument(
+        "--evening-leniency-ramp-s",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Override evening_lenient_ramp_s (linear 0→1 leniency weight over this span after --after-s).",
+    )
+    pt.add_argument(
+        "--evening-leniency-wedge-mult",
+        type=float,
+        default=None,
+        metavar="M",
+        help="Override evening_lenient_wedge_suppress_age_mult (>=1 typical).",
+    )
+    pt.add_argument(
+        "--evening-leniency-foot-mult",
+        type=float,
+        default=None,
+        metavar="M",
+        help="Override evening_lenient_foot_grace_mult (>=1 typical).",
+    )
+    pt.add_argument(
+        "--evening-leniency-min-budget-frac",
+        type=float,
+        default=None,
+        metavar="F",
+        help="Override evening_lenient_min_budget_frac; leniency only if remaining budget fraction ≥ this.",
+    )
     pt.add_argument("--out", type=str, default="", help="Optional path to save policy .pt")
     pt.add_argument(
         "--video-budget-minutes-per-day",
         type=float,
         default=0.0,
         help="If >0, set seconds_video_budget_per_day to this many minutes of camera-on per day_duration_s",
+    )
+    pt.add_argument(
+        "--video-budget-ref-speed",
+        type=float,
+        default=None,
+        metavar="M_S",
+        help="If set: video_budget_reference_walk_speed_m_s for scaling daily SI budget with walk_speed "
+        "(0 = fixed seconds regardless of speed). Omit for config default.",
     )
     pt.add_argument(
         "--no-train-progress",
@@ -241,6 +344,13 @@ def main(argv: list[str] | None = None) -> None:
         "--no-train-log",
         action="store_true",
         help="Disable training logs even when --out would imply a default log directory",
+    )
+    pt.add_argument(
+        "--observation-mode",
+        type=str,
+        choices=("foot_cell", "patch"),
+        default=None,
+        help="Env observation for RL policy: foot_cell (current cell features) or patch (local raster).",
     )
     _add_street_cli_args(pt)
     _add_home_commute_cli_args(pt)
@@ -262,7 +372,7 @@ def main(argv: list[str] | None = None) -> None:
         "--policy",
         type=str,
         default="random",
-        help="random | always_on | always_off | greedy_stale | greedy_budget",
+        help="random | always_on | always_off | greedy_stale | greedy_budget | greedy_unseen | greedy_unseen_progressive",
     )
     pv.add_argument("--seed", type=int, default=0)
     pv.add_argument(
@@ -285,7 +395,21 @@ def main(argv: list[str] | None = None) -> None:
         "--video-budget-minutes-per-day",
         type=float,
         default=0.0,
-        help="If >0, set seconds_video_budget_per_day to this many minutes of camera-on per day_duration_s (default is 5 min unless --fast)",
+        help="If >0, set seconds_video_budget_per_day to this many minutes of camera-on per day_duration_s (default is 10 min unless --fast)",
+    )
+    pv.add_argument(
+        "--video-budget-ref-speed",
+        type=float,
+        default=None,
+        metavar="M_S",
+        help="If set: video_budget_reference_walk_speed_m_s (0 = no walk-speed scaling of daily budget). Omit for config default.",
+    )
+    pv.add_argument(
+        "--observation-mode",
+        type=str,
+        choices=("foot_cell", "patch"),
+        default=None,
+        help="Override env observation mode when running visualize/eval policy episodes.",
     )
     _add_home_commute_cli_args(pv)
     _add_street_cli_args(pv)
@@ -322,6 +446,9 @@ def main(argv: list[str] | None = None) -> None:
     cfg: AdaptiveScanningConfig = _fast_cfg() if use_fast else _default_cfg()
     _merge_street_cli(cfg, args)
     _apply_home_commute_cli(cfg, args)
+    obs_mode = getattr(args, "observation_mode", None)
+    if obs_mode:
+        cfg.observation_mode = str(obs_mode)
 
     if args.cmd == "eval":
         from adaptive_scanning.policies import (
@@ -349,17 +476,65 @@ def main(argv: list[str] | None = None) -> None:
         rows["always_on_single_ep_final_uncovered"] = ref.final_uncovered_fraction
         print(json.dumps(rows, indent=2))
 
+    elif args.cmd == "coverage-eval":
+        from adaptive_scanning.coverage_eval import run_benchmark, write_benchmark_json
+
+        ck = (getattr(args, "checkpoint", "") or "").strip()
+        outp = (getattr(args, "out", "") or "").strip()
+        dev = (getattr(args, "device", "") or "").strip() or None
+        n_sc = int(getattr(args, "n_scenarios", 8))
+        payload = run_benchmark(
+            cfg,
+            checkpoint_path=ck if ck else None,
+            n_scenarios=n_sc,
+            seed0=int(args.seed),
+            device=dev,
+            oracle_per_day_budget=not bool(getattr(args, "oracle_global_budget", False)),
+        )
+        if outp:
+            write_benchmark_json(outp, payload)
+            print("wrote", outp)
+        print(json.dumps(payload, indent=2))
+
     elif args.cmd == "train":
         from adaptive_scanning.training import save_policy, train_reinforce
 
         vbm_tr = float(getattr(args, "video_budget_minutes_per_day", 0.0))
         if vbm_tr > 0.0:
             cfg.seconds_video_budget_per_day = float(vbm_tr) * 60.0
+        vbr = getattr(args, "video_budget_ref_speed", None)
+        if vbr is not None:
+            cfg.video_budget_reference_walk_speed_m_s = float(vbr)
 
         cfg.reward_camera_on_bonus = float(args.camera_on_bonus)
         ubp = getattr(args, "unused_budget_penalty", None)
         if ubp is not None:
             cfg.w_unused_budget_end_of_day = float(ubp)
+        wss = getattr(args, "w_stale_scanned", None)
+        if wss is not None:
+            cfg.w_stale_scanned = float(wss)
+        wu = getattr(args, "w_uncovered", None)
+        if wu is not None:
+            cfg.w_uncovered = float(wu)
+
+        if bool(getattr(args, "no_evening_leniency", False)):
+            cfg.evening_lenient_after_s_since_day_start = -1.0
+        else:
+            ela = getattr(args, "evening_leniency_after_s", None)
+            if ela is not None:
+                cfg.evening_lenient_after_s_since_day_start = float(ela)
+        elr = getattr(args, "evening_leniency_ramp_s", None)
+        if elr is not None:
+            cfg.evening_lenient_ramp_s = float(elr)
+        elwm = getattr(args, "evening_leniency_wedge_mult", None)
+        if elwm is not None:
+            cfg.evening_lenient_wedge_suppress_age_mult = float(elwm)
+        elfm = getattr(args, "evening_leniency_foot_mult", None)
+        if elfm is not None:
+            cfg.evening_lenient_foot_grace_mult = float(elfm)
+        elbf = getattr(args, "evening_leniency_min_budget_frac", None)
+        if elbf is not None:
+            cfg.evening_lenient_min_budget_frac = float(elbf)
 
         train_log: str | None = None
         if not bool(getattr(args, "no_train_log", False)):
@@ -400,8 +575,21 @@ def main(argv: list[str] | None = None) -> None:
         from adaptive_scanning.viz import visualize_episode
 
         vbm = float(getattr(args, "video_budget_minutes_per_day", 0.0))
-        if vbm > 0.0:
+        vbm_set = vbm > 0.0
+        if vbm_set:
             cfg.seconds_video_budget_per_day = float(vbm) * 60.0
+        vbr = getattr(args, "video_budget_ref_speed", None)
+        if vbr is not None:
+            cfg.video_budget_reference_walk_speed_m_s = float(vbr)
+
+        pol_name = str(args.policy).lower().strip()
+        if pol_name in ("greedy_unseen", "greedy_unseen_progressive", "greedy_unseen_prog"):
+            from dataclasses import replace
+
+            g_kw = {"update_last_seen_only_on_first_hit": True}
+            if not vbm_set:
+                g_kw["seconds_video_budget_per_day"] = 600.0
+            cfg = replace(cfg, **g_kw)
 
         path, traj_src, basemap, coverage_pack, playback_json, day_prefix_pack = visualize_episode(
             cfg,

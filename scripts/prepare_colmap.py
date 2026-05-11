@@ -33,7 +33,9 @@ COLMAP commands (printed at the end)
       --image_path outputs/colmap_input/images/ \\
       --output_path outputs/colmap_input/sparse/
 
-Run from repo root:  python scripts/prepare_colmap.py [--all | --budget N]
+Run from repo root:
+  python scripts/prepare_colmap.py [--all | --budget N]
+  python scripts/prepare_colmap.py --data-dir data_02_outputs --budget 120
 """
 
 from __future__ import annotations
@@ -186,10 +188,35 @@ def main() -> None:
     mode.add_argument("--all",    action="store_true", help="Use all available frames")
     mode.add_argument("--budget", type=int, default=36,
                       help="Number of frames to select via greedy staleness (default: 36)")
+    ap.add_argument("--data-dir", type=str, default="",
+                    help="Override data directory (e.g. data_02_outputs). "
+                         "Expects frames/, coverage/last_seen_sec.npy, frame_positions.json inside.")
     args = ap.parse_args()
 
+    # Allow overriding paths via --data-dir
+    global FRAMES_DIR, COVERAGE_NPY, POSITIONS_JSON, OUT_DIR
+    if args.data_dir:
+        base = ROOT / args.data_dir
+        FRAMES_DIR   = base / "frames"
+        COVERAGE_NPY = base / "coverage" / "last_seen_sec.npy"
+        POSITIONS_JSON = base / "frame_positions.json"
+        OUT_DIR      = base / "colmap_input"
+
     with open(POSITIONS_JSON) as f:
-        positions = json.load(f)
+        raw = json.load(f)
+    # Support both flat {fname: {...}} and nested {"meta":..., "frames":{...}} formats
+    positions = raw.get("frames", raw) if isinstance(raw, dict) and "frames" in raw else raw
+
+    # Normalise: ensure timestamp_sec exists (data_02 uses abs_utc_sec)
+    t_min = min(
+        (v.get("timestamp_sec") or v.get("abs_utc_sec") or 0.0) for v in positions.values()
+    )
+    for v in positions.values():
+        if "timestamp_sec" not in v:
+            v["timestamp_sec"] = round((v.get("abs_utc_sec") or 0.0) - t_min, 4)
+        if "heading_rad" not in v and "heading_deg" in v:
+            import math as _m
+            v["heading_rad"] = _m.radians(v["heading_deg"])
 
     ordered = sorted(positions.keys(), key=lambda n: positions[n]["timestamp_sec"])
     print(f"Total frames available: {len(ordered)}")
@@ -224,7 +251,7 @@ def main() -> None:
 
         p = positions[name]
         h_idx = ordered.index(name)
-        heading = heading_from_positions(positions, ordered, h_idx)
+        heading = p.get("heading_rad") or heading_from_positions(positions, ordered, h_idx)
 
         crop = crop_frame(src, heading)
         out_path = img_dir / name

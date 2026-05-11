@@ -16,13 +16,13 @@ class RolloutStats:
     final_uncovered_fraction: float
     final_mean_stale_normalized: float
     mean_reward: float
-    camera_on_fraction: float
+    camera_on_fraction: float  # effective camera on / moving steps (not requested-only)
 
 
 def run_episode(env: CameraBudgetEnv, policy: Policy, *, seed: int | None = None) -> RolloutStats:
     obs, info = env.reset(seed=seed)
     total_r = 0.0
-    on_steps = 0
+    effective_on_moving = 0
     moving_steps = 0
     steps = 0
     while True:
@@ -32,12 +32,12 @@ def run_episode(env: CameraBudgetEnv, policy: Policy, *, seed: int | None = None
             a = policy.act(obs, info)
         else:
             a = 0
-        if a == 1:
-            on_steps += 1
         step = env.step(a)
         total_r += step.reward
         obs = step.observation
         info = step.info
+        if is_moving and bool(info.get("camera_on_effective", False)):
+            effective_on_moving += 1
         steps += 1
         if step.terminated or step.truncated:
             final_u = info["uncovered_fraction"]
@@ -49,7 +49,7 @@ def run_episode(env: CameraBudgetEnv, policy: Policy, *, seed: int | None = None
         final_uncovered_fraction=final_u,
         final_mean_stale_normalized=final_s,
         mean_reward=total_r / max(steps, 1),
-        camera_on_fraction=on_steps / max(moving_steps, 1),
+        camera_on_fraction=effective_on_moving / max(moving_steps, 1),
     )
 
 
