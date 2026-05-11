@@ -149,6 +149,26 @@ def test_evening_lenient_greedy_unseen_reopens_mildly_stale_wedge():
     assert env_yes._info_dict()["foot_cell_greedy_unseen_on"] is True
 
 
+def test_info_includes_day_timing_and_foot_cell_ages():
+    env = CameraBudgetEnv(_tiny_cfg(), seed=0)
+    env.reset(seed=0)
+    info = env._info_dict()
+    assert "seconds_since_day_start" in info
+    assert "day_duration_s" in info
+    assert float(info["day_duration_s"]) == pytest.approx(300.0)
+    assert "foot_cell_wedge_age_s" in info
+    assert "foot_cell_foot_age_s" in info
+
+
+def test_progressive_rescan_policy_runs():
+    from adaptive_scanning.policies import BudgetAwareGreedyUnseenProgressiveRescanPolicy
+
+    cfg = _tiny_cfg()
+    cfg.observation_mode = "foot_cell"
+    st = run_episode(CameraBudgetEnv(cfg, seed=0), BudgetAwareGreedyUnseenProgressiveRescanPolicy(), seed=1)
+    assert st.steps > 0
+
+
 def test_stationary_interval_does_not_scan_or_spend_budget():
     env = CameraBudgetEnv(_tiny_cfg(), seed=1)
     _obs, info = env.reset(seed=42)

@@ -3954,6 +3954,7 @@ def policy_from_name(name: str, *, seed: int = 0) -> Policy:
         AlwaysOnPolicy,
         BudgetAwareGreedyPolicy,
         BudgetAwareGreedyUnseenOnlyPolicy,
+        BudgetAwareGreedyUnseenProgressiveRescanPolicy,
         GreedyLocalStalenessPolicy,
         RandomPolicy,
     )
@@ -3971,8 +3972,11 @@ def policy_from_name(name: str, *, seed: int = 0) -> Policy:
         return BudgetAwareGreedyPolicy()
     if name == "greedy_unseen":
         return BudgetAwareGreedyUnseenOnlyPolicy()
+    if name in ("greedy_unseen_progressive", "greedy_unseen_prog"):
+        return BudgetAwareGreedyUnseenProgressiveRescanPolicy()
     raise ValueError(
-        f"unknown policy name: {name!r} (try random, always_on, always_off, greedy_stale, greedy_budget, greedy_unseen)"
+        f"unknown policy name: {name!r} (try random, always_on, always_off, greedy_stale, greedy_budget, "
+        "greedy_unseen, greedy_unseen_progressive)"
     )
 
 

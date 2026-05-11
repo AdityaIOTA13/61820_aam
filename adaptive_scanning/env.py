@@ -339,6 +339,31 @@ class CameraBudgetEnv:
             union |= self._sector_mask(ax, ay, hd)
         return union
 
+    def coverage_mask_for_step_index(self, k: int) -> tuple[bool, np.ndarray]:
+        """
+        Forward-sector cell mask for the motion interval ``k → k+1`` (same geometry as
+        ``step`` when ``_step_idx == k``), without mutating env state.
+
+        Returns ``(interval_is_moving, union_mask)`` with ``union_mask`` shape ``(ny, nx)`` bool.
+        """
+        assert self._traj_x is not None
+        assert self._traj_y is not None
+        assert self._traj_h is not None
+        n = len(self._traj_x)
+        if k < 0 or k >= n - 1:
+            c = self.cfg
+            return False, np.zeros((c.ny, c.nx), dtype=bool)
+        ax0 = float(self._traj_x[k])
+        ay0 = float(self._traj_y[k])
+        hd0 = float(self._traj_h[k])
+        i1 = min(k + 1, n - 1)
+        ax1 = float(self._traj_x[i1])
+        ay1 = float(self._traj_y[i1])
+        hd1 = float(self._traj_h[i1])
+        interval_is_moving = math.hypot(ax1 - ax0, ay1 - ay0) > 1e-6
+        union = self._sector_union_mask_along_interval(ax0, ay0, hd0, ax1, ay1, hd1)
+        return bool(interval_is_moving), union
+
     def _sector_never_scanned_stats_next_interval(self) -> tuple[float, int, int]:
         """
         For the forward sector along the *next* motion interval (``_step_idx`` → ``_step_idx+1``):
@@ -451,6 +476,30 @@ class CameraBudgetEnv:
         if t_day < t0 - 1e-12:
             return 0.0
         return float(np.clip((t_day - t0) / ramp, 0.0, 1.0))
+
+    def _foot_cell_wedge_and_foot_ages_s(self) -> tuple[float, float]:
+        """
+        Simulated-time age (seconds) since ``last_seen`` / ``_last_seen_foot`` at the foot grid cell.
+
+        ``nan`` if out of bounds or the stamp was never set.
+        """
+        c = self.cfg
+        if self.last_seen is None or self._last_seen_foot is None or self._traj_x is None:
+            return float("nan"), float("nan")
+        if self._step_idx >= len(self._traj_x):
+            return float("nan"), float("nan")
+        ax = float(self._traj_x[self._step_idx])
+        ay = float(self._traj_y[self._step_idx])
+        ix = int(ax // c.resolution_m)
+        iy = int(ay // c.resolution_m)
+        if not (0 <= iy < c.ny and 0 <= ix < c.nx):
+            return float("nan"), float("nan")
+        T = float(self._sim_time_s)
+        ls = float(self.last_seen[iy, ix])
+        lf = float(self._last_seen_foot[iy, ix])
+        wedge = T - ls if math.isfinite(ls) else float("nan")
+        foot = T - lf if math.isfinite(lf) else float("nan")
+        return wedge, foot
 
     def _foot_cell_greedy_unseen_on(self) -> bool:
         """
@@ -619,8 +668,14 @@ class CameraBudgetEnv:
     def _info_dict(self) -> dict[str, Any]:
         assert self.last_seen is not None
         sec_fr, sec_nn, sec_nu = self._sector_never_scanned_stats_next_interval()
+        w_age, f_age = self._foot_cell_wedge_and_foot_ages_s()
         return {
+            "env_step_idx": int(self._step_idx),
             "sim_time_s": self._sim_time_s,
+            "seconds_since_day_start": float(self._sim_time_s - self._day_start_s),
+            "day_duration_s": float(self.cfg.day_duration_s),
+            "foot_cell_wedge_age_s": float(w_age),
+            "foot_cell_foot_age_s": float(f_age),
             "budget_s": self._budget_s,
             "seconds_video_budget_per_day_effective": float(daily_video_budget_seconds(self.cfg)),
             "uncovered_fraction": self._uncovered_fraction(),

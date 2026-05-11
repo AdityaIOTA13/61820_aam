@@ -2,6 +2,7 @@
 CLI for adaptive scanning simulation.
 
   python -m adaptive_scanning.run_sim eval
+  python -m adaptive_scanning.run_sim coverage-eval --streets --place "Cambridge, Massachusetts, USA" --n-scenarios 8 --checkpoint models/policy-coverage.pt --out outputs/eval_coverage.json
   python -m adaptive_scanning.run_sim train --epochs 30 --out models/policy.pt
   # With --out, also writes models/policy_training/{config.json,metrics.jsonl,history.json,training_curves.png}
   # Override: --train-log-dir PATH | disable: --no-train-log
@@ -204,6 +205,35 @@ def main(argv: list[str] | None = None) -> None:
     _add_street_cli_args(pe)
     _add_home_commute_cli_args(pe)
 
+    pce = sub.add_parser(
+        "coverage-eval",
+        help="N-scenario benchmark: trained / random / greedy unseen / greedy unseen+late rescan / oracle",
+    )
+    pce.add_argument("--fast", action="store_true", help="Small grid / short episode for smoke tests")
+    pce.add_argument("--n-scenarios", type=int, default=8, dest="n_scenarios")
+    pce.add_argument("--seed", type=int, default=0)
+    pce.add_argument(
+        "--checkpoint",
+        type=str,
+        default="",
+        help="Path to policy .pt (MLP). If set, all methods use the checkpoint's saved config.",
+    )
+    pce.add_argument(
+        "--out",
+        type=str,
+        default="",
+        help="Write JSON summary to this path (optional)",
+    )
+    pce.add_argument("--device", type=str, default="", help="torch device for MLP, e.g. cuda or cpu")
+    pce.add_argument(
+        "--oracle-global-budget",
+        action="store_true",
+        help="Oracle: use a single global pool of D×R ON steps (may exceed R on one day; "
+        "replay can clamp). Default is per-day feasible (≤ R per calendar day), matching the env.",
+    )
+    _add_street_cli_args(pce)
+    _add_home_commute_cli_args(pce)
+
     pt = sub.add_parser("train", help="Train REINFORCE MLP policy")
     pt.add_argument("--fast", action="store_true", help="Small grid / short horizon for smoke tests")
     pt.add_argument("--epochs", type=int, default=40)
@@ -342,7 +372,7 @@ def main(argv: list[str] | None = None) -> None:
         "--policy",
         type=str,
         default="random",
-        help="random | always_on | always_off | greedy_stale | greedy_budget | greedy_unseen",
+        help="random | always_on | always_off | greedy_stale | greedy_budget | greedy_unseen | greedy_unseen_progressive",
     )
     pv.add_argument("--seed", type=int, default=0)
     pv.add_argument(
@@ -446,6 +476,26 @@ def main(argv: list[str] | None = None) -> None:
         rows["always_on_single_ep_final_uncovered"] = ref.final_uncovered_fraction
         print(json.dumps(rows, indent=2))
 
+    elif args.cmd == "coverage-eval":
+        from adaptive_scanning.coverage_eval import run_benchmark, write_benchmark_json
+
+        ck = (getattr(args, "checkpoint", "") or "").strip()
+        outp = (getattr(args, "out", "") or "").strip()
+        dev = (getattr(args, "device", "") or "").strip() or None
+        n_sc = int(getattr(args, "n_scenarios", 8))
+        payload = run_benchmark(
+            cfg,
+            checkpoint_path=ck if ck else None,
+            n_scenarios=n_sc,
+            seed0=int(args.seed),
+            device=dev,
+            oracle_per_day_budget=not bool(getattr(args, "oracle_global_budget", False)),
+        )
+        if outp:
+            write_benchmark_json(outp, payload)
+            print("wrote", outp)
+        print(json.dumps(payload, indent=2))
+
     elif args.cmd == "train":
         from adaptive_scanning.training import save_policy, train_reinforce
 
@@ -532,7 +582,8 @@ def main(argv: list[str] | None = None) -> None:
         if vbr is not None:
             cfg.video_budget_reference_walk_speed_m_s = float(vbr)
 
-        if str(args.policy).lower().strip() == "greedy_unseen":
+        pol_name = str(args.policy).lower().strip()
+        if pol_name in ("greedy_unseen", "greedy_unseen_progressive", "greedy_unseen_prog"):
             from dataclasses import replace
 
             g_kw = {"update_last_seen_only_on_first_hit": True}
