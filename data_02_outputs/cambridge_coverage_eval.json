@@ -1,0 +1,52 @@
+{
+  "n_scenarios": 10,
+  "seed0": 0,
+  "checkpoint": null,
+  "dt_s": 0.511718204488778,
+  "oracle_per_day_budget": true,
+  "oracle_mode": "offline_set_cover",
+  "eval_config_note": "Cambridge Commons real walk. resolution=0.2m subsample=8 hfov=100 vfov=179 projection=backproject k_budget=1079 reachable_cells=18743 walk_span_s=615.6",
+  "summary": {
+    "random": {
+      "coverage_vs_theoretic_max_mean": 0.9032545483647227,
+      "coverage_vs_theoretic_max_std": 0.0033984011218940475,
+      "mean_age_scanned_sec_mean": 301.79131237034255,
+      "mean_age_scanned_sec_std": 1.5037070527442367,
+      "lcc_vs_theoretic_max_mean": 0.01205249959985061,
+      "lcc_vs_theoretic_max_std": 0.001143665254012297,
+      "effective_camera_on_sec_mean": 552.1439426433915,
+      "effective_camera_on_sec_std": 0.0
+    },
+    "greedy_unseen": {
+      "coverage_vs_theoretic_max_mean": 0.9477138131569119,
+      "coverage_vs_theoretic_max_std": 0.0,
+      "mean_age_scanned_sec_mean": 308.8997381635985,
+      "mean_age_scanned_sec_std": 0.0,
+      "lcc_vs_theoretic_max_mean": 0.0060289174625193405,
+      "lcc_vs_theoretic_max_std": 0.0,
+      "effective_camera_on_sec_mean": 552.1439426433915,
+      "effective_camera_on_sec_std": 0.0
+    },
+    "greedy_unseen_progressive": {
+      "coverage_vs_theoretic_max_mean": 0.9266926319159152,
+      "coverage_vs_theoretic_max_std": 0.0,
+      "mean_age_scanned_sec_mean": 288.84390094421093,
+      "mean_age_scanned_sec_std": 0.0,
+      "lcc_vs_theoretic_max_mean": 0.0060289174625193405,
+      "lcc_vs_theoretic_max_std": 0.0,
+      "effective_camera_on_sec_mean": 552.1439426433915,
+      "effective_camera_on_sec_std": 0.0
+    },
+    "oracle": {
+      "coverage_vs_theoretic_max_mean": 0.9678813423678173,
+      "coverage_vs_theoretic_max_std": 0.0,
+      "mean_age_scanned_sec_mean": 307.3426552560498,
+      "mean_age_scanned_sec_std": 0.0,
+      "lcc_vs_theoretic_max_mean": 0.007469455263298298,
+      "lcc_vs_theoretic_max_std": 0.0,
+      "effective_camera_on_sec_mean": 552.1439426433915,
+      "effective_camera_on_sec_std": 0.0
+    },
+    "trained": null
+  }
+}
